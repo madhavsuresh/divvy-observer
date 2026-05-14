@@ -15,7 +15,7 @@ from . import config, db, decision_metrics, dynamic_graph, label_builder, model_
 
 
 BASELINE_TRAIN_KEYS = ("empirical", "logistic", "random_forest", "gradient_boosting")
-SOTA_TRAIN_KEYS = ("cc_nissm", "stg_ncde_inventory", "dg_nissm", "tft_inventory")
+SOTA_TRAIN_KEYS = ("cc_nissm", "stg_ncde_inventory", "dg_nissm", "tft_inventory", "macflow_nissm_lite")
 
 
 def _utc_now() -> datetime:
@@ -451,6 +451,81 @@ def _dg_nissm_quality_gate(model: object, valid: pd.DataFrame) -> dict:
     return {"ok": True}
 
 
+def _train_macflow_nissm_lite(
+    train: pd.DataFrame,
+    valid: pd.DataFrame,
+    horizons: tuple[int, ...],
+    args: argparse.Namespace | None = None,
+) -> dict:
+    from .macflow_nissm import MacFlowNISSMLite, MacFlowNISSMLiteConfig
+    from .mobility_partitions import build_partition, upsert_station_communities
+
+    args = args or argparse.Namespace()
+    partition_mode = str(getattr(args, "partition_mode", "full") or "full")
+    config_obj = MacFlowNISSMLiteConfig(
+        hidden_dim=int(getattr(args, "hidden_dim", 64) or 64),
+        station_embedding_dim=int(getattr(args, "station_embedding_dim", 8) or 8),
+        device=str(getattr(args, "device", "auto") or "auto"),
+        epochs=int(getattr(args, "epochs", 5) or 5),
+        max_examples=int(getattr(args, "max_examples", 200_000) or 200_000),
+        lr=float(getattr(args, "lr", 1e-3) or 1e-3),
+        weight_decay=float(getattr(args, "weight_decay", 1e-4) or 1e-4),
+        seed=int(getattr(args, "seed", 42) or 42),
+        partition_mode=partition_mode,
+        calibrate=bool(getattr(args, "calibrate", True)),
+    )
+
+    partition = None
+    if not train.empty and "anchor_ts" in train.columns:
+        training_window_end = pd.to_datetime(train["anchor_ts"], errors="coerce").max()
+        if pd.notna(training_window_end):
+            try:
+                with db.session(read_only=False, retries=60, retry_sleep=1.0) as conn:
+                    db.init_schema(conn)
+                    partition = build_partition(
+                        conn,
+                        training_window_end=training_window_end.to_pydatetime().replace(tzinfo=None),
+                        lookback_days=int(config_obj.partition_lookback_days),
+                        seed=int(config_obj.seed),
+                    )
+                    try:
+                        upsert_station_communities(conn, partition)
+                    except Exception:
+                        pass
+            except Exception:
+                partition = None
+
+    model = MacFlowNISSMLite(config_obj)
+    model.fit(train, valid, graph_cache=partition)
+
+    if not getattr(model, "trained", False):
+        return {
+            "model_key": "macflow_nissm_lite",
+            "status": "skipped",
+            "reason": getattr(model, "model_warning", "fit skipped"),
+            "metrics": getattr(model, "metrics", {}),
+            "is_primary_eligible": False,
+        }
+    _mark_model_metadata(model, method=model.method, model_version=model.model_version)
+    result = {
+        "model_key": "macflow_nissm_lite",
+        "status": "trained",
+        "model_obj": model,
+        "model_family": "macflow_nissm_lite",
+        "model_version": model.model_version,
+        "feature_columns": list(model.feature_columns),
+        "is_primary_eligible": True,
+        "metrics": dict(getattr(model, "metrics", {}) or {}),
+    }
+    if result["metrics"].get("decision_rank_loss") is None:
+        result["metrics"]["decision_rank_loss"] = decision_metrics.decision_rank_loss(result["metrics"])
+    quality = _dg_nissm_quality_gate(model, valid)
+    if not quality["ok"]:
+        result["is_primary_eligible"] = False
+        result.setdefault("metrics", {})["quality_gate"] = quality
+    return result
+
+
 def _train_tft(train: pd.DataFrame, valid: pd.DataFrame) -> dict:
     if importlib.util.find_spec("pytorch_forecasting") is None or importlib.util.find_spec("lightning") is None:
         return {
@@ -714,6 +789,7 @@ def _single_command_to_key(command: str) -> str:
         "stg-ncde-inventory": "stg_ncde_inventory",
         "tft": "tft_inventory",
         "tft-inventory": "tft_inventory",
+        "macflow-nissm-lite": "macflow_nissm_lite",
     }[command]
 
 
@@ -730,6 +806,8 @@ def train_single(args: argparse.Namespace) -> dict:
         result = _train_dg_nissm(train, valid, horizons, args)
     elif model_key == "tft_inventory":
         result = _train_tft(train, valid)
+    elif model_key == "macflow_nissm_lite":
+        result = _train_macflow_nissm_lite(train, valid, horizons, args)
     else:
         result = {"model_key": model_key, "status": "skipped", "reason": "unknown model"}
     public_results = _register_results([result], train, valid, horizons) if args.register else [
@@ -832,12 +910,28 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--calibrate", dest="calibrate", action="store_true", default=True)
     parser.add_argument("--no-calibrate", dest="calibrate", action="store_false")
     parser.add_argument("--benchmark-runtime", action="store_true")
+    parser.add_argument(
+        "--partition-mode",
+        default="full",
+        choices=["off", "id_only", "id_plus_role", "full", "random", "spatial"],
+        help="MacFlow-NISSM-lite community-feature ablation mode (default: full).",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train Divvy offline inventory models")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ["all", "cc-nissm", "dg-nissm", "stg-ncde", "stg-ncde-inventory", "tft", "tft-inventory", "baselines"]:
+    for name in [
+        "all",
+        "cc-nissm",
+        "dg-nissm",
+        "stg-ncde",
+        "stg-ncde-inventory",
+        "tft",
+        "tft-inventory",
+        "baselines",
+        "macflow-nissm-lite",
+    ]:
         _add_shared_args(sub.add_parser(name))
     p = sub.add_parser("all-nightly")
     p.add_argument("--train-days", type=int, default=60)

@@ -477,6 +477,26 @@ CREATE TABLE IF NOT EXISTS external_events (
   created_at TIMESTAMP DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS station_communities (
+  partition_id          TEXT NOT NULL,
+  computed_at           TIMESTAMP NOT NULL,
+  source_data_start     TIMESTAMP,
+  source_data_end       TIMESTAMP NOT NULL,
+  algorithm             TEXT NOT NULL,
+  n_communities         INTEGER NOT NULL,
+  station_id            TEXT NOT NULL,
+  community_id          INTEGER NOT NULL,
+  role                  TEXT NOT NULL,
+  inbound_internal_share DOUBLE,
+  outbound_internal_share DOUBLE,
+  boundary_score        DOUBLE,
+  gateway_score         DOUBLE,
+  PRIMARY KEY (partition_id, station_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_station_communities_partition ON station_communities(partition_id);
+CREATE INDEX IF NOT EXISTS idx_station_communities_station ON station_communities(station_id);
+
 CREATE TABLE IF NOT EXISTS recommendation_outcomes (
   request_id TEXT,
   model_key TEXT,

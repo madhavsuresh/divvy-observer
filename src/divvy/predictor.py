@@ -28,6 +28,7 @@ SOTA_PRIMARY_MODEL_KEYS = (
     "cc_nissm",
     "stg_ncde_inventory",
     "tft_inventory",
+    "macflow_nissm_lite",
 )
 BASELINE_MODEL_KEYS = (
     "empirical",
@@ -41,6 +42,7 @@ MODEL_KEYS = (
     "cc_nissm",
     "stg_ncde_inventory",
     "tft_inventory",
+    "macflow_nissm_lite",
     "inventory_world",
     "logistic",
     "random_forest",
@@ -66,6 +68,10 @@ MODEL_SPECS = {
     "tft_inventory": {
         "label": "TFT inventory flow",
         "version": "tft-inventory-bootstrap-v1",
+    },
+    "macflow_nissm_lite": {
+        "label": "MacFlow-NISSM-lite mobility-community flow",
+        "version": "macflow-nissm-lite-v1",
     },
     "inventory_world": {
         "label": "Distributional inventory world",
@@ -272,7 +278,7 @@ class FittedAvailabilityModel:
     def usable(self) -> bool:
         if self.model is None:
             return False
-        if self.model_key == "dg_nissm":
+        if self.model_key in {"dg_nissm", "macflow_nissm_lite"}:
             return bool(
                 getattr(self.model, "trained", False)
                 and getattr(self.model, "net", None) is not None
@@ -2055,6 +2061,10 @@ def _sota_model_class(model_key: str):
         from .tft_inventory import TFTInventoryModel
 
         return TFTInventoryModel
+    if model_key == "macflow_nissm_lite":
+        from .macflow_nissm import MacFlowNISSMLite
+
+        return MacFlowNISSMLite
     raise KeyError(model_key)
 
 
@@ -2100,7 +2110,7 @@ def _load_registry_model(
     if not artifact or artifact.get("model") is None:
         return None
     model = artifact["model"]
-    if model_key == "dg_nissm" and not (
+    if model_key in {"dg_nissm", "macflow_nissm_lite"} and not (
         getattr(model, "trained", False)
         and getattr(model, "net", None) is not None
         and getattr(model, "tabular_scaler", None) is not None
@@ -2155,6 +2165,20 @@ def _runtime_fallback_model(
                 model_version=spec["version"],
                 artifact_id=None,
                 model_warning="No trained DG-NISSM artifact found; using non-DG fallback models.",
+            )
+        if model_key == "macflow_nissm_lite":
+            return FittedAvailabilityModel(
+                model=None,
+                trained_at=_utc_now(),
+                n_examples=int(n_examples),
+                n_positive=int(n_positive),
+                n_negative=max(0, int(n_examples) - int(n_positive)),
+                method="macflow_nissm_lite_unavailable_no_trained_artifact",
+                model_key=model_key,
+                label=spec["label"],
+                model_version=spec["version"],
+                artifact_id=None,
+                model_warning="No trained MacFlow-NISSM-lite artifact found; using non-MacFlow fallback models.",
             )
         try:
             model = _sota_model_class(model_key)()
