@@ -1,0 +1,28 @@
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and packaging output
+.venv/
+.env
+.env.*
+dist/
+build/
+*.egg-info/
+
+# Runtime/generated project data
+data/
+diagnostics/
+logs/
+
+# Local/editor state
+.DS_Store
+.claude/*.lock
+
+# Coverage artifacts
+.coverage
+htmlcov/

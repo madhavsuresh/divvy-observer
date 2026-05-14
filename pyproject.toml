@@ -1,0 +1,39 @@
+[project]
+name = "divvy-observer"
+version = "0.1.0"
+description = "Long-running observatory for Chicago Divvy bike-share stations."
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.32",
+    "duckdb>=1.1",
+    "streamlit>=1.39",
+    "pandas>=2.2",
+    "altair>=5.4",
+    "streamlit-geolocation>=0.0.10",
+    "pydeck>=0.9",
+    "fastapi>=0.136.1",
+    "pydantic>=2.13.4",
+    "scikit-learn>=1.8.0",
+    "pytest>=9.0.3",
+    "httpx>=0.28.1",
+    "uvicorn>=0.46.0",
+    "numpy>=2.4.4",
+    "torch>=2.12.0",
+    "torchcde>=0.2.5",
+    "h3>=4",
+]
+
+[project.scripts]
+divvy = "divvy.automation:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/divvy"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with -m 'not slow')",
+]
