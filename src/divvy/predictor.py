@@ -447,6 +447,11 @@ def apply_cold_start_probability_guard(
 
 
 def cap_zero_current_without_inbound_support(row: pd.Series, p: float) -> float:
+    # TODO: replace this heuristic cap with an arrival-aware P(no bikes) — even
+    # when current_ebikes == 0, P(bike at horizon t) is non-trivial because of
+    # incoming arrivals (someone may park a bike at the empty dock). The ZINB
+    # arrival channels in cdg_nmip already provide the signal; this cap should
+    # be derived from those rather than hand-tuned.
     current_ebikes = int(_finite_float(row.get("num_ebikes_available"), 0.0))
     if current_ebikes > 0:
         return float(p)

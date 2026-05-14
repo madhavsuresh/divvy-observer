@@ -1184,6 +1184,10 @@ def fast_inventory_rollout_from_parameters(
     p_dock_constrained = 0.0
     if attempted_arrivals > 1e-9:
         p_dock_constrained = float(np.clip((attempted_arrivals - open_after_depart) / (attempted_arrivals + 1.0), 0.0, 1.0))
+    # TODO: emit p_has_open_dock as a first-class prediction target — the
+    # parking-side dual of p_has_ebike. Riders returning a bike need a PMF
+    # over open-dock count at horizon t, just as pickup planners use p_has_ebike.
+    # p_dock_constrained above is a flow-constraint heuristic, not the same quantity.
     return inventory_dp.InventoryRolloutResult(
         p_has_ebike=float(1.0 - p_zero),
         p_zero=p_zero,
