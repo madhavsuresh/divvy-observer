@@ -79,10 +79,29 @@ def all_station_candidates(conn: duckdb.DuckDBPyConnection, max_staleness_minute
 
 def _value(row: pd.Series, base: str, horizon: int, model_key: str):
     value = row.get(f"{base}_{horizon}m_{model_key}")
-    if value is None or (not isinstance(value, dict) and pd.isna(value)):
+    if value is None or (not isinstance(value, (dict, list)) and pd.isna(value)):
         if model_key == row.get("active_model_key"):
             value = row.get(f"{base}_{horizon}m")
     return value
+
+
+def _count_ebikes_pmf_payload(row: pd.Series, horizon: int, model_key: str):
+    """Build the cache JSON payload for ``p_count_ebikes``.
+
+    Folds the full PMF (length ``capacity+1``) into the bucketed dict under the
+    ``__full__`` key, keeping the legacy bucket keys (``"0".."5_plus"``) so
+    existing consumers are unaffected. Returns ``None`` if no data is available.
+    """
+    bucket = _value(row, "p_count_ebikes", int(horizon), model_key)
+    full = _value(row, "p_count_ebikes_full", int(horizon), model_key)
+    bucket_dict = bucket if isinstance(bucket, dict) else None
+    full_list = list(full) if isinstance(full, (list, tuple)) and len(full) > 0 else None
+    if bucket_dict is None and full_list is None:
+        return None
+    out: dict = dict(bucket_dict) if bucket_dict is not None else {}
+    if full_list is not None:
+        out["__full__"] = full_list
+    return out
 
 
 def _prediction_rows_from_scored(
@@ -118,7 +137,7 @@ def _prediction_rows_from_scored(
                     _maybe_float(_value(row, "p_survives", int(horizon), model_key)),
                     _maybe_float(_value(row, "expected_ebikes", int(horizon), model_key)),
                     _maybe_float(_value(row, "expected_total_bikes", int(horizon), model_key)),
-                    _json_text(_value(row, "p_count_ebikes", int(horizon), model_key)),
+                    _json_text(_count_ebikes_pmf_payload(row, int(horizon), model_key)),
                     _json_text(_value(row, "p_count_total", int(horizon), model_key)),
                     _maybe_float(_value(row, "p_capacity_violation", int(horizon), model_key)),
                     _maybe_float(_value(row, "p_dock_constrained_arrival", int(horizon), model_key)),

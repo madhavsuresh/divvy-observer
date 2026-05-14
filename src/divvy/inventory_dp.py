@@ -24,6 +24,7 @@ class InventoryRolloutResult:
     expected_ebike_arrivals: float
     expected_classic_arrivals: float
     p_joint_e_q: np.ndarray | None = None
+    p_count_ebikes_full: list[float] | None = None
 
 
 def _safe_int(value: int | float | None, default: int = 0) -> int:
@@ -409,6 +410,7 @@ def rollout_inventory_distribution_multistep(
         expected_ebike_arrivals=float(expected_ae),
         expected_classic_arrivals=float(expected_ac),
         p_joint_e_q=state.copy() if return_joint else None,
+        p_count_ebikes_full=e_pmf.tolist(),
     )
 
 
@@ -457,4 +459,5 @@ def rollout_inventory_distribution(
         expected_classic_departures=float(metrics["expected_classic_departures"]),
         expected_ebike_arrivals=float(metrics["expected_ebike_arrivals"]),
         expected_classic_arrivals=float(metrics["expected_classic_arrivals"]),
+        p_count_ebikes_full=e_pmf.tolist(),
     )

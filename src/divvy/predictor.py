@@ -221,6 +221,7 @@ DISTRIBUTION_OUTPUT_COLUMNS = [
     "expected_ebikes",
     "expected_total_bikes",
     "p_count_ebikes",
+    "p_count_ebikes_full",
     "p_count_total",
     "p_capacity_violation",
     "p_dock_constrained_arrival",
@@ -476,6 +477,32 @@ def _align_count_distribution_to_p_zero(value, p_zero: float):
     if total > 0:
         out = {key: float(val / total) for key, val in out.items()}
     return out
+
+
+def _align_count_full_to_p_zero(value, p_zero: float):
+    if value is None:
+        return value
+    if not isinstance(value, (list, tuple, np.ndarray)):
+        return value
+    arr = np.asarray(value, dtype=float)
+    if arr.size == 0:
+        return value
+    arr = np.where(np.isfinite(arr), arr, 0.0)
+    arr = np.clip(arr, 0.0, None)
+    target_zero = float(np.clip(_finite_float(p_zero, 0.0), 0.0, 1.0))
+    out = arr.copy()
+    out[0] = target_zero
+    if out.size == 1:
+        return [1.0]
+    positive_total = float(arr[1:].sum())
+    if positive_total > 0:
+        out[1:] = arr[1:] * ((1.0 - target_zero) / positive_total)
+    elif target_zero < 1.0:
+        out[1] = out[1] + (1.0 - target_zero)
+    total = float(out.sum())
+    if total > 0:
+        out = out / total
+    return out.tolist()
 
 
 def _confidence(sample_size: int, data_age_minutes: float | None = None) -> str:
@@ -1544,6 +1571,7 @@ class InventoryWorldRolloutModel:
                 "expected_ebikes": rollout.expected_ebikes,
                 "expected_total_bikes": rollout.expected_total_bikes,
                 "p_count_ebikes": rollout.p_count_ebikes,
+                "p_count_ebikes_full": rollout.p_count_ebikes_full,
                 "p_count_total": rollout.p_count_total,
                 "p_capacity_violation": rollout.p_capacity_violation,
                 "p_dock_constrained_arrival": rollout.p_dock_constrained_arrival,
@@ -2621,6 +2649,11 @@ def _score_feature_rows(
         scored["p_count_ebikes"] = [
             _align_count_distribution_to_p_zero(dist, p_zero)
             for dist, p_zero in zip(scored["p_count_ebikes"], scored["p_zero"])
+        ]
+    if "p_count_ebikes_full" in scored.columns:
+        scored["p_count_ebikes_full"] = [
+            _align_count_full_to_p_zero(dist, p_zero)
+            for dist, p_zero in zip(scored["p_count_ebikes_full"], scored["p_zero"])
         ]
     scored["p_appears"] = np.where(scored["num_ebikes_available"] <= 0, scored["p_has_ebike"], np.nan)
     scored["p_survives"] = np.where(scored["num_ebikes_available"] > 0, scored["p_has_ebike"], np.nan)

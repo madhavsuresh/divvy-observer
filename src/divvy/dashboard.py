@@ -191,6 +191,32 @@ def _prediction_recommendation(
         )
 
 
+@st.cache_data(ttl=60)
+def _prediction_multi_bike_plan(
+    lat: float,
+    lon: float,
+    k: int,
+    near_radius_km: float,
+    search_radius_km: float,
+    plan_horizon_minutes: int,
+    target_success_probability: float,
+    query_label: str | None,
+) -> dict:
+    with db.session(read_only=True) as conn:
+        return recommendations.plan_multi_bike_acquisition(
+            conn,
+            lat=lat,
+            lon=lon,
+            k=int(k),
+            near_radius_km=near_radius_km,
+            search_radius_km=search_radius_km,
+            plan_horizon_minutes=plan_horizon_minutes,
+            target_success_probability=target_success_probability,
+            query_label=query_label,
+            source="streamlit_multi_bike",
+        )
+
+
 @st.cache_data(ttl=120)
 def _prediction_performance(window_hours: int) -> dict:
     with db.session(read_only=True) as conn:
@@ -900,11 +926,372 @@ def _prediction_map(lat: float, lon: float, result: dict) -> None:
             c4.metric("Ebikes now", clicked.get("current_ebikes", "-"))
 
 
+def _plan_stop_card(index: int, stop: dict) -> None:
+    badge = f"Stop {index}"
+    stop_type = stop.get("stop_type")
+    if stop_type == "free_bike":
+        title = f"#{badge} · Free bike {stop.get('name') or stop.get('bike_id')}"
+        primary_label = "P(still there)"
+        primary_value = _prob_label(stop.get("p_has_ebike_at_horizon"))
+    else:
+        title = f"#{badge} · {stop.get('name') or 'Station'}"
+        primary_label = "P(≥1 eBike)"
+        primary_value = _prob_label(stop.get("p_has_ebike_at_horizon"))
+    st.markdown(f"**{title}**")
+    st.metric(primary_label, primary_value)
+    walk_total = stop.get("walk_minutes_from_user", 0.0)
+    walk_step = stop.get("walk_minutes_from_previous", walk_total)
+    distance = stop.get("distance_from_user_km")
+    expected = stop.get("expected_pickup")
+    horizon = stop.get("horizon_minutes")
+    parts: list[str] = []
+    if walk_step is not None:
+        parts.append(f"{_minutes_label(walk_step)} from last stop")
+    if walk_total is not None:
+        parts.append(f"{_minutes_label(walk_total)} from you")
+    if distance is not None:
+        parts.append(_distance_label(distance))
+    if expected is not None:
+        parts.append(f"E[bikes] ≈ {float(expected):.2f}")
+    if horizon is not None:
+        parts.append(f"horizon {int(horizon)}m")
+    if stop_type == "station":
+        current = stop.get("current_ebikes")
+        if current is not None:
+            parts.append(f"{int(current)} now")
+        if stop.get("degraded"):
+            parts.append("degraded PMF")
+    elif stop_type == "free_bike" and stop.get("p_stays_source"):
+        parts.append(f"source: {stop['p_stays_source']}")
+    st.caption(" · ".join(parts))
+
+
+def _plan_map(
+    lat: float,
+    lon: float,
+    plan: dict,
+    *,
+    key: str = "plan_map",
+    unused_free_bikes: list[dict] | None = None,
+) -> None:
+    stops = plan.get("stops") or []
+    if not stops and not unused_free_bikes:
+        return
+
+    rows: list[dict] = []
+    path_coords: list[list[float]] = [[lon, lat]]
+    for idx, stop in enumerate(stops, start=1):
+        s_lat = stop.get("lat")
+        s_lon = stop.get("lon")
+        if s_lat is None or s_lon is None:
+            continue
+        stop_type = stop.get("stop_type") or "station"
+        if stop_type == "free_bike":
+            fill = [60, 180, 255, 230]
+            radius_m = 120.0
+            count_str = "free-floating"
+        else:
+            fill = [255, 180, 40, 235]
+            radius_m = 140.0
+            current = stop.get("current_ebikes")
+            count_str = f"{int(current)} eBikes now" if current is not None else "—"
+        expected = stop.get("expected_pickup")
+        expected_str = f"{float(expected):.1f}" if expected is not None else "—"
+        walk_step = stop.get("walk_minutes_from_previous")
+        walk_total = stop.get("walk_minutes_from_user")
+        rows.append({
+            "label": str(idx),
+            "name": stop.get("name") or stop_type,
+            "lat": float(s_lat),
+            "lon": float(s_lon),
+            "p_label": _prob_label(stop.get("p_has_ebike_at_horizon")),
+            "walk_step_label": _minutes_label(walk_step if walk_step is not None else walk_total or 0.0),
+            "walk_total_label": _minutes_label(walk_total if walk_total is not None else 0.0),
+            "count_label": count_str,
+            "expected_label": expected_str,
+            "horizon_label": f"{int(stop.get('horizon_minutes') or 10)}m",
+            "fill_r": fill[0],
+            "fill_g": fill[1],
+            "fill_b": fill[2],
+            "fill_a": fill[3],
+            "radius_m": radius_m,
+            "stop_type": stop_type,
+        })
+        path_coords.append([float(s_lon), float(s_lat)])
+
+    if not rows and not unused_free_bikes:
+        return
+
+    unused_rows: list[dict] = []
+    for bike in unused_free_bikes or []:
+        if bike.get("lat") is None or bike.get("lon") is None:
+            continue
+        unused_rows.append({
+            "name": f"Free bike {bike.get('name') or bike.get('bike_id')}",
+            "lat": float(bike["lat"]),
+            "lon": float(bike["lon"]),
+            "p_label": _prob_label(bike.get("p_stays")),
+            "walk_total_label": _minutes_label(bike.get("walk_minutes_from_user") or 0.0),
+            "count_label": "free-floating (not in plan)",
+            "expected_label": f"{float(bike.get('p_stays') or 0.0):.2f}",
+            "horizon_label": f"{int(bike.get('horizon_minutes') or 10)}m",
+        })
+
+    layers = []
+    if len(path_coords) >= 2:
+        layers.append(
+            pdk.Layer(
+                "PathLayer",
+                id=f"{key}_path",
+                data=pd.DataFrame([{"path": path_coords, "name": "Plan route"}]),
+                get_path="path",
+                get_color=[40, 110, 200, 210],
+                get_width=4,
+                width_min_pixels=3,
+                pickable=False,
+            )
+        )
+    if unused_rows:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                id=f"{key}_unused_free",
+                data=pd.DataFrame(unused_rows),
+                get_position="[lon, lat]",
+                get_radius=55,
+                get_fill_color=[120, 200, 255, 130],
+                get_line_color=[20, 20, 20, 160],
+                line_width_min_pixels=1,
+                radius_min_pixels=5,
+                radius_max_pixels=12,
+                pickable=True,
+                stroked=True,
+                filled=True,
+            )
+        )
+    if rows:
+        layers.extend([
+            pdk.Layer(
+                "ScatterplotLayer",
+                id=f"{key}_stops",
+                data=pd.DataFrame(rows),
+                get_position="[lon, lat]",
+                get_radius="radius_m",
+                get_fill_color="[fill_r, fill_g, fill_b, fill_a]",
+                get_line_color=[20, 20, 20, 255],
+                line_width_min_pixels=2,
+                radius_min_pixels=10,
+                radius_max_pixels=42,
+                pickable=True,
+                stroked=True,
+                filled=True,
+            ),
+            pdk.Layer(
+                "TextLayer",
+                id=f"{key}_numbers",
+                data=pd.DataFrame(rows),
+                get_position="[lon, lat]",
+                get_text="label",
+                get_size=18,
+                get_color=[20, 20, 20, 255],
+                get_alignment_baseline="'center'",
+                get_pixel_offset=[0, 0],
+                pickable=False,
+            ),
+        ])
+    layers.append(
+        pdk.Layer(
+            "ScatterplotLayer",
+            id=f"{key}_you",
+            data=pd.DataFrame({"lat": [lat], "lon": [lon]}),
+            get_position="[lon, lat]",
+            get_radius=42,
+            get_fill_color=[20, 20, 20, 235],
+            get_line_color=[255, 255, 255, 255],
+            line_width_min_pixels=2,
+            radius_min_pixels=8,
+            radius_max_pixels=14,
+            pickable=False,
+            stroked=True,
+            filled=True,
+        )
+    )
+
+    tooltip = {
+        "html": (
+            "<b>{name}</b><br/>"
+            "P(get bike here): <b>{p_label}</b><br/>"
+            "Available: {count_label}<br/>"
+            "E[count at +{horizon_label}]: {expected_label}<br/>"
+            "Walk from previous: {walk_step_label}<br/>"
+            "Walk from start: {walk_total_label}"
+        ),
+        "style": {"backgroundColor": "rgba(30,30,30,0.88)", "color": "white", "fontSize": "12px"},
+    }
+    deck = pdk.Deck(
+        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+        initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=14, pitch=0),
+        layers=layers,
+        tooltip=tooltip,
+    )
+    st.pydeck_chart(deck, use_container_width=True, key=key)
+
+
+def _render_multi_bike_plan(
+    lat: float,
+    lon: float,
+    k: int,
+    near_radius_km: float,
+    search_radius_km: float,
+    plan_horizon_minutes: int,
+    target_success_probability: float,
+    query_label: str | None,
+) -> None:
+    try:
+        result = _prediction_multi_bike_plan(
+            lat,
+            lon,
+            int(k),
+            near_radius_km,
+            search_radius_km,
+            plan_horizon_minutes,
+            target_success_probability,
+            query_label,
+        )
+    except (duckdb.Error, requests.RequestException) as exc:
+        st.warning(f"Multi-bike plan unavailable: {exc}")
+        return
+
+    plan = result.get("plan") or {}
+    alternatives = result.get("alternative_plans") or []
+    candidate_count = result.get("candidate_count", 0)
+    station_count = result.get("station_candidate_count", 0)
+    free_count = result.get("free_bike_candidate_count", 0)
+    feasible = bool(result.get("feasible"))
+    unmet = int(result.get("unmet_demand") or 0)
+
+    metrics_cols = st.columns(4)
+    metrics_cols[0].metric(
+        f"P(≥{int(k)} bikes)", _prob_label(plan.get("success_probability"))
+    )
+    metrics_cols[1].metric(
+        "Total walking", _minutes_label(plan.get("total_walking_minutes"))
+    )
+    metrics_cols[2].metric("Stops in plan", str(int(plan.get("n_stops") or 0)))
+    metrics_cols[3].metric("Expected bikes", f"{float(plan.get('expected_bikes') or 0.0):.2f}")
+
+    badges = []
+    badges.append(f"{station_count} station candidates")
+    badges.append(f"{free_count} free-bike candidates")
+    badges.append(f"target {int(target_success_probability * 100)}%")
+    if not feasible:
+        badges.append(f"NOT feasible · unmet ≈ {unmet}")
+    st.caption(" · ".join(badges))
+
+    if not plan.get("stops"):
+        st.info("No reachable stops produced a plan. Try a wider search radius.")
+        return
+
+    unused_free = result.get("unused_free_bikes") or []
+    nearby_unused_for_map = unused_free[:8]
+
+    _plan_map(
+        lat,
+        lon,
+        plan,
+        key=f"plan_map_k{int(k)}",
+        unused_free_bikes=nearby_unused_for_map,
+    )
+
+    st.markdown("**Plan**")
+    stops = plan.get("stops") or []
+    cols_per_row = 3
+    for start in range(0, len(stops), cols_per_row):
+        slice_ = stops[start : start + cols_per_row]
+        cols = st.columns(len(slice_))
+        for idx_offset, stop in enumerate(slice_):
+            with cols[idx_offset]:
+                _plan_stop_card(start + idx_offset + 1, stop)
+
+    if unused_free:
+        with st.expander(
+            f"Free-floating eBikes nearby not in plan ({len(unused_free)})",
+            expanded=True,
+        ):
+            st.caption(
+                "Light-blue dots on the map. The planner kept these as backups "
+                "because their P(stays) was lower than what's already in the plan, "
+                "but they're still useful if a stop is empty when you arrive."
+            )
+            preview = unused_free[: min(6, len(unused_free))]
+            cols_per_row = 3
+            for start in range(0, len(preview), cols_per_row):
+                slice_ = preview[start : start + cols_per_row]
+                cols = st.columns(len(slice_))
+                for idx, bike in enumerate(slice_):
+                    with cols[idx]:
+                        st.markdown(f"**Free bike {bike.get('name') or bike.get('bike_id')}**")
+                        st.metric(
+                            f"P(stays {int(bike.get('horizon_minutes') or 10)}m)",
+                            _prob_label(bike.get("p_stays")),
+                        )
+                        st.caption(
+                            f"{_distance_label(bike.get('distance_km'))} away · "
+                            f"{_minutes_label(bike.get('walk_minutes_from_user') or 0.0)} walk · "
+                            f"source: {bike.get('p_stays_source') or '—'}"
+                        )
+
+    if alternatives:
+        with st.expander("Alternative plans", expanded=True):
+            tabs = st.tabs([alt.get("strategy", f"Plan {i+1}") for i, alt in enumerate(alternatives)])
+            for tab, alt in zip(tabs, alternatives):
+                with tab:
+                    alt_cols = st.columns(3)
+                    alt_cols[0].metric("Success", _prob_label(alt.get("success_probability")))
+                    alt_cols[1].metric("Walk", _minutes_label(alt.get("total_walking_minutes")))
+                    alt_cols[2].metric("Stops", str(int(alt.get("n_stops") or 0)))
+                    _plan_map(
+                        lat,
+                        lon,
+                        alt,
+                        key=f"plan_map_alt_{alt.get('strategy', 'x')}_k{int(k)}",
+                    )
+
+    st.caption(
+        "Probability assumes independent stops; free-bike survival via tile_predictor. "
+        f"Active model: {result.get('active_model_key') or '—'}. "
+        f"Cache: {result.get('prediction_cache_status') or '—'}."
+    )
+
+
 def _prediction_service_section(lat: float, lon: float) -> None:
     st.markdown("### Prediction service")
     near_radius_km = 0.5
     search_radius_km = 1.5
     query_label = st.session_state.get("user_location_label") or f"{lat:.4f}, {lon:.4f}"
+    k = int(
+        st.number_input(
+            "How many ebikes do you need?",
+            min_value=1,
+            max_value=10,
+            value=1,
+            step=1,
+            key="prediction_service_k",
+            help="When greater than 1, the page returns an ordered pickup plan instead of a single station.",
+        )
+    )
+    if k > 1:
+        _render_multi_bike_plan(
+            lat=lat,
+            lon=lon,
+            k=k,
+            near_radius_km=near_radius_km,
+            search_radius_km=search_radius_km,
+            plan_horizon_minutes=10,
+            target_success_probability=0.85,
+            query_label=query_label,
+        )
+        return
     try:
         result = _prediction_recommendation(lat, lon, near_radius_km, search_radius_km, query_label)
     except (duckdb.Error, requests.RequestException) as exc:

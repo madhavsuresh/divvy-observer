@@ -28,6 +28,23 @@ class BacktestRequest(BaseModel):
     history_hours: int = Field(24 * 7, ge=2, le=24 * 90)
 
 
+class MultiBikePlanRequest(BaseModel):
+    lat: float = Field(..., ge=-90.0, le=90.0)
+    lon: float = Field(..., ge=-180.0, le=180.0)
+    k: int = Field(..., ge=1, le=10)
+    near_radius_km: float = Field(0.5, gt=0.0, le=3.0)
+    search_radius_km: float = Field(1.5, gt=0.0, le=3.0)
+    plan_horizon_minutes: int = Field(10, ge=5, le=30)
+    target_success_probability: float = Field(0.85, gt=0.0, le=0.99)
+    place_label: str | None = Field(None, max_length=240)
+
+    @model_validator(mode="after")
+    def _radius_order(self) -> "MultiBikePlanRequest":
+        if self.search_radius_km < self.near_radius_km:
+            raise ValueError("search_radius_km must be greater than or equal to near_radius_km")
+        return self
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     yield
@@ -118,6 +135,61 @@ def recommendation_endpoint(payload: RecommendationRequest) -> dict:
         except Exception as exc:
             result["forecast_rows_queued"] = 0
             result["forecast_queue_error"] = str(exc)
+    return result
+
+
+@app.post("/api/v1/multi_bike_plan")
+def multi_bike_plan_endpoint(payload: MultiBikePlanRequest) -> dict:
+    """Plan to acquire ``k`` ebikes near (lat, lon) by combining stations and free-floating bikes."""
+    try:
+        with db.session(read_only=True) as conn:
+            result = recommendations.plan_multi_bike_acquisition(
+                conn,
+                lat=payload.lat,
+                lon=payload.lon,
+                k=payload.k,
+                near_radius_km=payload.near_radius_km,
+                search_radius_km=payload.search_radius_km,
+                plan_horizon_minutes=payload.plan_horizon_minutes,
+                target_success_probability=payload.target_success_probability,
+                query_label=payload.place_label,
+                source="api_multi_bike",
+                include_internal=True,
+            )
+    except duckdb.Error as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    scored = result.pop("_scored_for_logging", None)
+    recommended_ids = result.pop("_recommended_station_ids", [])
+    recommended_ids_by_model = result.pop("_recommended_station_ids_by_model", {})
+    result["forecast_rows_logged"] = 0
+    result["forecast_logging_mode"] = "queued_for_collector"
+    if scored is not None and not scored.empty and recommended_ids:
+        try:
+            queue_result = forecast_queue.enqueue_recommendation_forecasts(
+                scored,
+                request_id=result["request_id"],
+                source="api_multi_bike",
+                user_lat=payload.lat,
+                user_lon=payload.lon,
+                near_radius_km=payload.near_radius_km,
+                search_radius_km=payload.search_radius_km,
+                query_label=payload.place_label,
+                query_place_key=result.get("query_place_key"),
+                candidate_count=int(result.get("candidate_count") or 0),
+                best_station_id=recommended_ids[0] if recommended_ids else None,
+                recommended_station_ids=recommended_ids,
+                recommended_station_ids_by_model=recommended_ids_by_model,
+                active_model_key=(result.get("model") or {}).get("active_model_key"),
+                active_model_source=(result.get("model") or {}).get("active_model_source"),
+                best_evaluated_model_key=(result.get("model") or {}).get("best_evaluated_model_key"),
+            )
+            result["forecast_rows_queued"] = queue_result["queued_forecast_rows"]
+        except Exception as exc:
+            result["forecast_rows_queued"] = 0
+            result["forecast_queue_error"] = str(exc)
+    else:
+        result["forecast_rows_queued"] = 0
     return result
 
 
