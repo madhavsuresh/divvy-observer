@@ -14,6 +14,20 @@
         "--browser.gatherUsageStats=false"
       ],
       "port": 8501
+    },
+    {
+      "name": "divvy-dashboard-test",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": [
+        "run",
+        "streamlit",
+        "run",
+        "src/divvy/dashboard.py",
+        "--server.headless=true",
+        "--server.port=8505",
+        "--browser.gatherUsageStats=false"
+      ],
+      "port": 8505
     }
   ]
 }
