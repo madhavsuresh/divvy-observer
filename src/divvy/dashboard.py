@@ -11,7 +11,7 @@ import requests
 import streamlit as st
 from streamlit_geolocation import streamlit_geolocation
 
-from divvy import analytics, config, db, disabled_predictor, live_cache, model_eval, model_registry, model_selection, predictor, recommendations, service_state, tile, tile_predictor
+from divvy import analytics, config, db, disabled_predictor, live_cache, model_eval, model_selection, predictor, recommendations, service_state, tile, tile_predictor
 from divvy.display import display_probability
 
 DOW_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
@@ -326,12 +326,6 @@ def _model_metric_trend(model_key: str | None, days: int) -> pd.DataFrame:
             """,
             [days],
         ).df()
-
-
-@st.cache_data(ttl=120)
-def _model_artifacts() -> list[dict]:
-    with db.session(read_only=True) as conn:
-        return model_registry.list_artifacts(conn)
 
 
 @st.cache_data(ttl=60)
@@ -1539,71 +1533,6 @@ def _model_performance_panel(perf: dict) -> None:
         _render_survival_tab(window_hours, active_key)
 
 
-def _model_status_banner(perf: dict, model_payload: dict) -> None:
-    active_key = model_payload.get("active_model_key") or (perf.get("active_model") or {}).get("model_key")
-    active_label = (
-        model_payload.get("active_model_display_label")
-        or model_payload.get("active_model_label")
-        or predictor.MODEL_SPECS.get(active_key or "", {}).get("label")
-        or active_key
-        or "-"
-    )
-    source = model_payload.get("active_model_source") or (perf.get("active_model") or {}).get("active_model_source") or "-"
-    best = perf.get("best_current_model") or {}
-    models_by_key = {
-        str(item.get("model_key")): item
-        for item in (model_payload.get("models") or [])
-        if item.get("model_key") is not None
-    }
-    best_evaluated_key = model_payload.get("best_evaluated_model_key") or best.get("model_key")
-    best_evaluated_label = (
-        model_payload.get("best_evaluated_model_label")
-        or best.get("model_label")
-        or best.get("best_model_label")
-        or predictor.MODEL_SPECS.get(best_evaluated_key or "", {}).get("label")
-        or best_evaluated_key
-        or "-"
-    )
-    best_usable_key = model_payload.get("best_usable_model_key")
-    best_usable_label = (
-        model_payload.get("best_usable_model_label")
-        or predictor.MODEL_SPECS.get(best_usable_key or "", {}).get("label")
-        or best_usable_key
-        or "-"
-    )
-    best_trained_sota_key = model_payload.get("best_trained_sota_model_key")
-    best_trained_sota_label = (
-        predictor.MODEL_SPECS.get(best_trained_sota_key or "", {}).get("label")
-        or best_trained_sota_key
-        or "-"
-    )
-    active_warning = model_payload.get("active_model_warning") or model_payload.get("model_warning")
-    best_evaluated_summary = models_by_key.get(str(best_evaluated_key), {}) if best_evaluated_key else {}
-    best_evaluated_usable = bool(best_evaluated_summary.get("usable")) if best_evaluated_summary else None
-    with st.container(border=True):
-        cols = st.columns(4)
-        cols[0].metric("Active prediction driver", active_label)
-        cols[0].caption(
-            f"key: {active_key or '-'} · source: {source} · "
-            f"artifact: {model_payload.get('active_artifact_id') or 'none'} · "
-            f"method: {model_payload.get('method') or '-'}"
-        )
-        metric_name = best.get("metric") or model_payload.get("selection_metric") or "decision_rank_loss"
-        cols[1].metric("Best evaluated model", best_evaluated_label)
-        cols[1].caption(
-            f"{metric_name} · {int(best.get('n') or 0):,} resolved · "
-            f"{perf.get('window_hours', model_payload.get('selection_window_hours', 24))}h"
-        )
-        cols[2].metric("Best usable model", best_usable_label)
-        cols[2].caption(f"key: {best_usable_key or '-'}")
-        cols[3].metric("Best trained SOTA", best_trained_sota_label)
-        cols[3].caption(f"key: {best_trained_sota_key or '-'}")
-        if active_warning:
-            st.warning("Probabilities are provisional because no trained SOTA artifact is registered yet.")
-        if best_evaluated_key and best_evaluated_usable is False:
-            st.caption(f"Best evaluated historical model: {best_evaluated_key}. Current artifact unavailable.")
-
-
 def _age_minutes(ts) -> float | None:
     if ts is None or pd.isna(ts):
         return None
@@ -2322,19 +2251,16 @@ def _prediction_service_section(lat: float, lon: float) -> None:
     model = result.get("model", {})
     formula = result.get("ranking_formula") or {}
     perf = _prediction_performance(24)
-    _model_status_banner(perf, model)
-    debug_probabilities = st.checkbox("Show raw probabilities", value=False, key="prediction_debug_probabilities")
 
     top_cols = st.columns(2)
     with top_cols[0]:
-        _prediction_card("Best practical docked eBike", practical, primary="score", debug_probabilities=debug_probabilities)
+        _prediction_card("Best practical docked eBike", practical, primary="score")
     with top_cols[1]:
         _prediction_card(
             "Highest-probability docked eBike",
             highest_probability,
             primary="probability",
             probability_key="p_arrival",
-            debug_probabilities=debug_probabilities,
         )
 
     if formula:
@@ -2389,7 +2315,6 @@ def _prediction_service_section(lat: float, lon: float) -> None:
             docked,
             primary="probability",
             probability_key="p_survives_10m",
-            debug_probabilities=debug_probabilities,
         )
     with cols[1]:
         st.markdown("**Closest free-floating eBike**")
@@ -2458,29 +2383,10 @@ def _prediction_service_section(lat: float, lon: float) -> None:
 
     _model_performance_panel(perf)
 
-    artifacts = pd.DataFrame(_model_artifacts())
-    if not artifacts.empty:
-        with st.expander("Model detail panel", expanded=False):
-            detail_cols = [
-                "artifact_id",
-                "model_key",
-                "model_version",
-                "trained_at",
-                "train_start",
-                "train_end",
-                "valid_start",
-                "valid_end",
-                "feature_columns",
-                "calibration_json",
-                "is_primary_eligible",
-                "is_active",
-            ]
-            panel = artifacts[[column for column in detail_cols if column in artifacts.columns]].copy()
-            if "feature_columns" in panel:
-                panel["feature_count"] = panel["feature_columns"].apply(lambda value: len(value) if isinstance(value, list) else 0)
-                panel = panel.drop(columns=["feature_columns"])
-            st.dataframe(panel, hide_index=True)
-
+    # Per-place leaderboard kept — it's the only place-sliced view on the page.
+    # Legacy "Model detail panel" (artifact metadata) and "Rolling model
+    # performance" (per-horizon table) were removed; their content is in the
+    # _model_performance_panel "By horizon" tab and the model_artifacts table.
     place_models = pd.DataFrame(perf.get("by_place_model") or [])
     if not place_models.empty:
         with st.expander("Model leaderboard by searched place", expanded=False):
@@ -2501,37 +2407,6 @@ def _prediction_service_section(lat: float, lon: float) -> None:
                 },
             )
 
-    by_horizon = pd.DataFrame(perf.get("by_horizon") or [])
-    if not by_horizon.empty:
-        with st.expander("Rolling model performance", expanded=False):
-            horizon_columns = [
-                "horizon_minutes",
-                "n",
-                "brier_score",
-                "log_loss",
-                "count_log_loss",
-                "crps",
-                "observed_rate",
-                "mean_prediction",
-            ]
-            by_horizon_display = by_horizon[[column for column in horizon_columns if column in by_horizon.columns]].copy()
-            for column in ["observed_rate", "mean_prediction"]:
-                if column in by_horizon_display.columns:
-                    by_horizon_display[column] = by_horizon_display[column].map(_prob_label)
-            st.dataframe(
-                by_horizon_display,
-                hide_index=True,
-                column_config={
-                    "horizon_minutes": "Horizon",
-                    "n": "Resolved forecasts",
-                    "brier_score": st.column_config.NumberColumn("Brier", format="%.3f"),
-                    "log_loss": st.column_config.NumberColumn("Log loss", format="%.3f"),
-                    "count_log_loss": st.column_config.NumberColumn("Count NLL", format="%.3f"),
-                    "crps": st.column_config.NumberColumn("CRPS", format="%.3f"),
-                    "observed_rate": "Observed hit rate",
-                    "mean_prediction": "Mean prediction",
-                },
-            )
 
 
 def _station_prediction_detail_section(station_id: str) -> None:
