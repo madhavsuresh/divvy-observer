@@ -9,6 +9,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
+import requests
+
 from . import (
     config,
     db,
@@ -24,6 +26,7 @@ from . import (
     scheduler,
     service_state,
     train_sota,
+    tripdata,
 )
 
 
@@ -43,6 +46,8 @@ WRITE_JOBS = {
     "train-nightly",
     "train-weekly",
     "refresh-graphs",
+    "sync-tripdata",
+    "retrain-macflow",
 }
 
 
@@ -137,6 +142,100 @@ def _job_refresh_graphs() -> dict:
         return dynamic_graph.refresh_dynamic_graph_cache(conn, lookback_days=30, top_k=16)
 
 
+def _job_sync_tripdata() -> dict:
+    """Pull the most recent few months of Divvy trip data, idempotently.
+
+    Divvy publishes the previous month's data around the 10th. Trying the
+    last 3 completed months on a daily cadence guarantees we pick up new
+    months within ~24h of release without re-downloading anything we
+    already have.
+
+    Months that 404 (S3 hasn't published them yet) are skipped silently.
+    The flow-tables rebuild is deferred to ``rebuild_flow_tables`` only when
+    we actually inserted new months, to avoid the O(divvy_trips) cost on
+    no-op days.
+    """
+    with db.session(read_only=False) as conn:
+        db.init_schema(conn)
+        already = tripdata.months_already_loaded(conn)
+        attempted: list[dict] = []
+        new_results = []
+        for year, month in tripdata.completed_months(3):
+            if (year, month) in already:
+                attempted.append({"month": f"{year}-{month:02d}", "status": "already_loaded"})
+                continue
+            try:
+                result = tripdata.download_month(conn, year, month)
+            except requests.HTTPError as exc:
+                status = getattr(exc.response, "status_code", None)
+                if status == 404:
+                    attempted.append({"month": f"{year}-{month:02d}", "status": "missing_on_s3"})
+                    continue
+                raise
+            new_results.append(result)
+            attempted.append({
+                "month": f"{year}-{month:02d}",
+                "status": "downloaded",
+                "rows_inserted": result.rows_inserted,
+                "rows_seen": result.rows_seen,
+            })
+        if new_results:
+            flow = tripdata.rebuild_flow_tables(conn)
+            return {
+                "attempted": attempted,
+                "rows_inserted": sum(r.rows_inserted for r in new_results),
+                "flow_rows": flow.flow_rows,
+                "route_rows": flow.route_rows,
+            }
+        return {"attempted": attempted, "rows_inserted": 0}
+
+
+def _job_retrain_macflow() -> dict:
+    """Retrain only macflow_nissm_lite on the current data.
+
+    Lighter than train-nightly (which does all 5 SOTA models). Useful when
+    a tripdata sync has just landed new historical months and we want
+    macflow's flow-derived features to reflect that without paying the
+    full nightly cost.
+    """
+    args = argparse.Namespace(
+        command="single",
+        model="macflow_nissm_lite",
+        history_hours=24 * 60,
+        valid_hours=24 * 7,
+        anchor_every_min=config.TRAIN_ANCHOR_EVERY_MIN,
+        horizons=list(__import__("divvy.predictor", fromlist=["HORIZONS"]).HORIZONS),
+        max_source_rows=2_000_000,
+        device="auto",
+        register=True,
+        activate=None,
+        activate_best_sota=False,
+        coexist_live=True,
+        time_budget_hours=4.0,
+        strict=False,
+        epochs=8,
+        batch_size=4096,
+        max_examples=600_000,
+        hidden_dim=128,
+        station_embedding_dim=32,
+        seq_len=24,
+        seq_step_minutes=2,
+        top_k=16,
+        lr=1e-3,
+        weight_decay=1e-4,
+        seed=42,
+        no_sequence=False,
+        no_graph=False,
+        calibrate=True,
+        benchmark_runtime=True,
+        stg_max_examples=None,
+        stg_epochs=None,
+        stg_batch_size=None,
+        partition_mode="full",
+    )
+    return train_sota.train_single(args)
+
+
 JOBS: dict[str, Callable[[], dict]] = {
     "drain-forecast-queue": _job_drain_forecast_queue,
     "resolve-outcomes": _job_resolve_outcomes,
@@ -150,6 +249,8 @@ JOBS: dict[str, Callable[[], dict]] = {
     "train-nightly": _job_train_nightly,
     "train-weekly": _job_train_weekly,
     "refresh-graphs": _job_refresh_graphs,
+    "sync-tripdata": _job_sync_tripdata,
+    "retrain-macflow": _job_retrain_macflow,
 }
 
 
