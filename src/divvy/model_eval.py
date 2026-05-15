@@ -1075,6 +1075,130 @@ def multi_bike_performance_summary(
     return {"window_hours": window_hours, "by_plan_size": by_plan_size}
 
 
+def per_horizon_performance_summary(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window_hours: int = 24,
+    initialize_schema: bool = True,
+) -> dict:
+    """Per-(horizon, model) leaderboard across all resolved forecasts.
+
+    Used by the dashboard's "By horizon" benchmark to show how each model's
+    skill degrades (or doesn't) as the prediction horizon stretches. Same
+    metric set as ``performance_summary`` but grouped by horizon_minutes.
+
+    Returns:
+        {
+          "window_hours": int,
+          "horizons": [int, ...],          # sorted, distinct
+          "by_horizon": {
+              horizon_minutes: {
+                "horizon_minutes": int,
+                "model_leaderboard": [_metric_row + {model_key, model_label, rank}, ...],
+              }
+          },
+        }
+    """
+    if initialize_schema:
+        init_schema(conn)
+    joined = _joined_forecasts(conn, window_hours)
+    if joined.empty:
+        return {"window_hours": window_hours, "horizons": [], "by_horizon": {}}
+
+    joined["observed_has_ebike"] = joined["observed_has_ebike"].astype(bool)
+    joined["p_has_ebike"] = joined["p_has_ebike"].astype(float).clip(0.001, 0.999)
+
+    by_horizon: dict[int, dict] = {}
+    horizons_sorted = sorted({int(h) for h in joined["horizon_minutes"].dropna().unique()})
+    for horizon in horizons_sorted:
+        slice_df = joined[joined["horizon_minutes"] == horizon]
+        if slice_df.empty:
+            continue
+        rows = []
+        for model_key, group in slice_df.groupby("model_key"):
+            row = _metric_row(group)
+            row["model_key"] = model_key
+            row["model_label"] = (
+                group["model_label"].dropna().iloc[0]
+                if group["model_label"].notna().any()
+                else model_key
+            )
+            rows.append(row)
+        rows.sort(key=lambda r: math.inf if r.get("rank_loss") is None else r["rank_loss"])
+        for rank, row in enumerate(rows, start=1):
+            row["rank"] = rank
+        by_horizon[int(horizon)] = {
+            "horizon_minutes": int(horizon),
+            "model_leaderboard": rows,
+        }
+
+    return {
+        "window_hours": window_hours,
+        "horizons": horizons_sorted,
+        "by_horizon": by_horizon,
+    }
+
+
+def empty_station_performance_summary(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window_hours: int = 24,
+    initialize_schema: bool = True,
+) -> dict:
+    """Per-model leaderboard restricted to forecasts where current_ebikes == 0.
+
+    This is a fundamentally harder problem than the full distribution: at an
+    empty station, P(has eBike at horizon) reduces to "will a bike arrive?",
+    which models that lean on autocorrelation can't fake. Models that
+    actually represent arrival rates (empirical, ZINB-based, graph flow)
+    have a chance to differentiate themselves here.
+
+    Returns the same shape as ``performance_summary`` (single leaderboard)
+    so the dashboard renderer can reuse the slim-leaderboard helper.
+    """
+    if initialize_schema:
+        init_schema(conn)
+    joined = _joined_forecasts(conn, window_hours)
+    if joined.empty:
+        return {
+            "window_hours": window_hours,
+            "n_total": 0,
+            "appearance_rate": None,
+            "model_leaderboard": [],
+        }
+    joined = joined[joined["current_ebikes"].fillna(-1).astype(int) == 0].copy()
+    if joined.empty:
+        return {
+            "window_hours": window_hours,
+            "n_total": 0,
+            "appearance_rate": None,
+            "model_leaderboard": [],
+        }
+    joined["observed_has_ebike"] = joined["observed_has_ebike"].astype(bool)
+    joined["p_has_ebike"] = joined["p_has_ebike"].astype(float).clip(0.001, 0.999)
+    appearance_rate = float(joined["observed_has_ebike"].astype(float).mean())
+
+    rows = []
+    for model_key, group in joined.groupby("model_key"):
+        row = _metric_row(group)
+        row["model_key"] = model_key
+        row["model_label"] = (
+            group["model_label"].dropna().iloc[0]
+            if group["model_label"].notna().any()
+            else model_key
+        )
+        rows.append(row)
+    rows.sort(key=lambda r: math.inf if r.get("rank_loss") is None else r["rank_loss"])
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    return {
+        "window_hours": window_hours,
+        "n_total": int(len(joined)),
+        "appearance_rate": appearance_rate,
+        "model_leaderboard": rows,
+    }
+
+
 def best_performing_model(
     conn: duckdb.DuckDBPyConnection,
     window_hours: int = 24,

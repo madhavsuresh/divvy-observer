@@ -240,6 +240,22 @@ def _multi_bike_performance(window_hours: int) -> dict:
 
 
 @st.cache_data(ttl=120)
+def _per_horizon_performance(window_hours: int) -> dict:
+    with db.session(read_only=True) as conn:
+        return model_eval.per_horizon_performance_summary(
+            conn, window_hours=window_hours, initialize_schema=False
+        )
+
+
+@st.cache_data(ttl=120)
+def _empty_station_performance(window_hours: int) -> dict:
+    with db.session(read_only=True) as conn:
+        return model_eval.empty_station_performance_summary(
+            conn, window_hours=window_hours, initialize_schema=False
+        )
+
+
+@st.cache_data(ttl=120)
 def _model_metric_trend(model_key: str | None, days: int) -> pd.DataFrame:
     """Per-model rolling Brier/N over the last N days for the trend sparkline."""
     with db.session(read_only=True) as conn:
@@ -897,6 +913,158 @@ def _render_active_model_charts(perf: dict, active_key: str | None, active_label
 MULTI_BIKE_PLAN_SIZES = (2, 3, 4, 5)
 
 
+def _render_by_horizon_tab(window_hours: int, active_key: str | None, best_key: str | None) -> None:
+    """How does each model degrade as the prediction horizon stretches?
+
+    Shows a Brier-by-horizon line chart (color = model) plus a leaderboard
+    aggregated across horizons. The hypothesis worth checking here is whether
+    SOTA models close the gap on simple models when autocorrelation weakens
+    (i.e. at 30/45/60/90 min) — if they do, this view will surface it.
+    """
+    try:
+        payload = _per_horizon_performance(window_hours)
+    except Exception as exc:
+        st.error(f"per-horizon query failed: {exc}")
+        return
+    horizons = payload.get("horizons") or []
+    by_horizon = payload.get("by_horizon") or {}
+    if not horizons:
+        st.info(f"No resolved forecasts in the last {window_hours}h.")
+        return
+
+    rows: list[dict] = []
+    for h in horizons:
+        for r in by_horizon.get(h, {}).get("model_leaderboard", []):
+            rows.append({
+                "horizon_minutes": int(h),
+                "model_key": r.get("model_key"),
+                "model_label": r.get("model_label"),
+                "n": r.get("n"),
+                "brier_score": r.get("brier_score"),
+                "rank_loss": r.get("rank_loss"),
+            })
+    long_df = pd.DataFrame(rows)
+    if long_df.empty:
+        st.info(f"No resolved forecasts in the last {window_hours}h.")
+        return
+
+    st.markdown(
+        f"**Brier by horizon — last {window_hours}h.** "
+        f"Horizons currently emitted: {', '.join(f'{h}m' for h in horizons)}. "
+        "Lower is better. A flat line = horizon-robust model; a steeply rising "
+        "line = a model that loses skill quickly as the future gets fuzzier."
+    )
+    chart = (
+        alt.Chart(long_df.dropna(subset=["brier_score"]))
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("horizon_minutes:Q", title="Horizon (minutes)", scale=alt.Scale(zero=False)),
+            y=alt.Y("brier_score:Q", title="Brier score (lower is better)", scale=alt.Scale(zero=False)),
+            color=alt.Color("model_label:N", title="Model"),
+            tooltip=[
+                alt.Tooltip("model_label:N", title="Model"),
+                alt.Tooltip("horizon_minutes:Q", title="Horizon"),
+                alt.Tooltip("brier_score:Q", format=".4f", title="Brier"),
+                alt.Tooltip("n:Q", title="N"),
+            ],
+        )
+        .properties(height=280)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+    available_set = set(int(h) for h in horizons)
+    long_horizons = [30, 45, 60, 90]
+    missing_long = [h for h in long_horizons if h not in available_set]
+    if missing_long:
+        st.caption(
+            f"Horizons {missing_long} have no resolved forecasts yet. "
+            "After restarting the stack with the extended `predictor.HORIZONS`, "
+            "the long-horizon points will start appearing within ~10 min for 30m, "
+            "~45 min for 45m, ~70 min for 60m, and ~100 min for 90m forecasts."
+        )
+
+    avg = (
+        long_df.groupby(["model_key", "model_label"], as_index=False)
+        .agg(
+            avg_brier=("brier_score", "mean"),
+            avg_rank_loss=("rank_loss", "mean"),
+            total_n=("n", "sum"),
+        )
+        .sort_values("avg_brier", na_position="last")
+    )
+    if avg.empty:
+        return
+    baseline = avg[avg["model_key"] == BASELINE_MODEL_KEY]
+    baseline_brier = baseline.iloc[0]["avg_brier"] if not baseline.empty else None
+    avg["skill_score"] = avg["avg_brier"].apply(lambda b: _skill_score(b, baseline_brier))
+    avg["model_display"] = avg.apply(
+        lambda r: (
+            ("🟢 " if str(r.get("model_key")) == active_key else "")
+            + ("🥇 " if str(r.get("model_key")) == best_key and str(r.get("model_key")) != active_key else "")
+            + str(r.get("model_label") or r.get("model_key"))
+        ),
+        axis=1,
+    )
+    avg["skill_score"] = avg["skill_score"].map(_skill_label)
+    st.markdown("**Average across horizons**")
+    st.dataframe(
+        avg[["model_display", "total_n", "avg_brier", "avg_rank_loss", "skill_score"]],
+        hide_index=True,
+        column_config={
+            "model_display": "Model",
+            "total_n": st.column_config.NumberColumn("Total resolved", format="%d"),
+            "avg_brier": st.column_config.NumberColumn("Avg Brier", format="%.4f"),
+            "avg_rank_loss": st.column_config.NumberColumn("Avg rank loss", format="%.4f"),
+            "skill_score": st.column_config.Column(
+                "Skill vs baseline",
+                help="Mean Brier across horizons compared to the logistic baseline's mean.",
+            ),
+        },
+    )
+
+
+def _render_empty_station_tab(
+    window_hours: int, active_key: str | None, best_key: str | None
+) -> None:
+    """Performance restricted to forecasts at currently-empty stations.
+
+    At an empty station, P(has eBike at horizon) is essentially "will a bike
+    arrive in the next N minutes?" — autocorrelation gives no signal. Models
+    that explicitly represent arrival rates (empirical, ZINB-based,
+    graph-flow) have a chance to differentiate themselves here.
+    """
+    try:
+        payload = _empty_station_performance(window_hours)
+    except Exception as exc:
+        st.error(f"empty-station query failed: {exc}")
+        return
+    rows = payload.get("model_leaderboard") or []
+    n_total = int(payload.get("n_total") or 0)
+    appearance_rate = payload.get("appearance_rate")
+    if not rows or n_total == 0:
+        st.info(
+            f"No resolved forecasts at currently-empty stations in the last {window_hours}h. "
+            "This will populate as the collector + automation drain the queue."
+        )
+        return
+    headline_bits = [f"{n_total:,} resolved forecasts at empty stations"]
+    if appearance_rate is not None:
+        headline_bits.append(f"appearance rate {appearance_rate * 100:.1f}%")
+    st.markdown(
+        f"**At currently-empty stations** ({' · '.join(headline_bits)} in last {window_hours}h). "
+        "This isolates the *arrival* problem — current bike count = 0, so the question is "
+        "whether the model can predict that a bike will appear. Autocorrelation-driven models "
+        "lose their easy advantage; models that represent arrival dynamics have a chance to win."
+    )
+    _render_leaderboard_block(
+        rows,
+        active_key=active_key,
+        best_key=best_key,
+        window_hours=window_hours,
+        key_prefix="model_perf_empty",
+    )
+
+
 def _model_performance_panel(perf: dict) -> None:
     """Health-first model performance section.
 
@@ -930,7 +1098,11 @@ def _model_performance_panel(perf: dict) -> None:
     except Exception as exc:
         multi = {"by_plan_size": {}, "_error": str(exc)}
 
-    tab_labels = ["All forecasts"] + [f"k={k} plans" for k in MULTI_BIKE_PLAN_SIZES]
+    tab_labels = (
+        ["All forecasts"]
+        + [f"k={k} plans" for k in MULTI_BIKE_PLAN_SIZES]
+        + ["By horizon", "Empty stations"]
+    )
     tabs = st.tabs(tab_labels)
 
     with tabs[0]:
@@ -951,7 +1123,8 @@ def _model_performance_panel(perf: dict) -> None:
         _render_active_model_charts(perf, active_key, active_label)
 
     by_plan_size = (multi or {}).get("by_plan_size") or {}
-    for tab, k in zip(tabs[1:], MULTI_BIKE_PLAN_SIZES):
+    multi_tab_count = len(MULTI_BIKE_PLAN_SIZES)
+    for tab, k in zip(tabs[1:1 + multi_tab_count], MULTI_BIKE_PLAN_SIZES):
         with tab:
             payload = by_plan_size.get(k) or {"n_requests": 0, "model_leaderboard": []}
             n_req = int(payload.get("n_requests") or 0)
@@ -978,6 +1151,13 @@ def _model_performance_panel(perf: dict) -> None:
                 key_prefix=f"model_perf_k{k}",
                 scope_caption=scope_caption,
             )
+
+    by_horizon_tab = tabs[1 + multi_tab_count]
+    empty_station_tab = tabs[2 + multi_tab_count]
+    with by_horizon_tab:
+        _render_by_horizon_tab(window_hours, active_key, best_key)
+    with empty_station_tab:
+        _render_empty_station_tab(window_hours, active_key, best_key)
 
 
 def _model_status_banner(perf: dict, model_payload: dict) -> None:
