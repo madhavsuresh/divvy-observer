@@ -199,8 +199,9 @@ def _job_retrain_macflow() -> dict:
     full nightly cost.
     """
     args = argparse.Namespace(
-        command="single",
-        model="macflow_nissm_lite",
+        # train_sota.train_single dispatches off args.command via
+        # _single_command_to_key — the value must be the hyphenated alias.
+        command="macflow-nissm-lite",
         history_hours=24 * 60,
         valid_hours=24 * 7,
         anchor_every_min=config.TRAIN_ANCHOR_EVERY_MIN,
