@@ -389,9 +389,17 @@ def resolve_due_outcomes(
     *,
     tolerance_minutes: int = 3,
     limit: int = 5000,
+    max_age_hours: int = 6,
 ) -> int:
-    """Attach the first observed station state at or after each forecast target."""
+    """Attach the first observed station state at or after each forecast target.
+
+    Forecasts whose ``target_at`` is older than ``max_age_hours`` are skipped:
+    once the station-status tolerance window has closed, no later poll can
+    satisfy them, so retrying every tick just blocks the resolver from
+    reaching newer forecasts that *are* resolvable.
+    """
     init_schema(conn)
+    now = _utc_now()
     due = conn.execute(
         """
         SELECT
@@ -413,10 +421,11 @@ def resolve_due_outcomes(
         LEFT JOIN model_outcomes o USING (forecast_id)
         WHERE o.forecast_id IS NULL
           AND f.target_at <= ?
-        ORDER BY f.target_at
+          AND f.target_at >= ?
+        ORDER BY f.target_at DESC
         LIMIT ?
         """,
-        [_utc_now(), limit],
+        [now, now - timedelta(hours=max_age_hours), limit],
     ).fetchall()
     if not due:
         return 0
@@ -941,6 +950,129 @@ def performance_summary(
         "active_equals_best": bool(active_key == (best_current_model or {}).get("model_key")) if best_current_model else None,
         "worst_station_hours": worst,
     }
+
+
+def multi_bike_performance_summary(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window_hours: int = 24,
+    plan_sizes: tuple[int, ...] = (2, 3, 4, 5),
+    sources: tuple[str, ...] = ("api_multi_bike",),
+    initialize_schema: bool = True,
+) -> dict:
+    """Per-plan-size leaderboard for multi-bike-plan requests.
+
+    For each multi-bike request we count the recommended stops to derive the
+    plan size, then aggregate per-(plan_size, model) metrics over **all**
+    candidate forecasts that landed in those requests (not just the picked
+    stops — that pool is too small for stable Brier estimates).
+
+    Returns a dict keyed by plan size:
+        {
+          "window_hours": int,
+          "by_plan_size": {
+              k: {
+                "plan_size": k,
+                "n_requests": int,
+                "model_leaderboard": [_metric_row + {model_key, model_label, rank}, ...],
+              }
+              for k in plan_sizes
+          },
+        }
+    Plan sizes with no requests in the window are still returned with empty
+    leaderboards so the UI can show a "no data yet" tile.
+    """
+    if initialize_schema:
+        init_schema(conn)
+    placeholders = ",".join("?" for _ in sources)
+    requested = tuple(int(k) for k in plan_sizes)
+
+    requests = conn.execute(
+        f"""
+        SELECT
+          request_id,
+          COUNT(DISTINCT CASE WHEN is_recommended THEN station_id END) AS plan_size
+        FROM model_forecasts
+        WHERE source IN ({placeholders})
+          AND forecasted_at > now() - (? * INTERVAL '1 hour')
+        GROUP BY request_id
+        """,
+        list(sources) + [window_hours],
+    ).df()
+    if not requests.empty:
+        requests["plan_size"] = pd.to_numeric(requests["plan_size"], errors="coerce").fillna(0).astype(int)
+
+    by_plan_size: dict[int, dict] = {}
+    if requests.empty:
+        for k in requested:
+            by_plan_size[int(k)] = {"plan_size": int(k), "n_requests": 0, "model_leaderboard": []}
+        return {"window_hours": window_hours, "by_plan_size": by_plan_size}
+
+    request_ids_in_scope = requests.loc[requests["plan_size"].isin(requested), "request_id"].tolist()
+    if not request_ids_in_scope:
+        for k in requested:
+            n_req = int((requests["plan_size"] == k).sum())
+            by_plan_size[int(k)] = {"plan_size": int(k), "n_requests": n_req, "model_leaderboard": []}
+        return {"window_hours": window_hours, "by_plan_size": by_plan_size}
+
+    placeholders_ids = ",".join("?" for _ in request_ids_in_scope)
+    joined = conn.execute(
+        f"""
+        SELECT
+          f.request_id,
+          f.model_key,
+          COALESCE(f.model_label, f.model_version) AS model_label,
+          f.p_has_ebike,
+          o.observed_has_ebike,
+          o.observed_ebikes,
+          o.count_log_prob,
+          o.crps,
+          f.expected_ebikes,
+          f.p_capacity_violation,
+          f.p_dock_constrained_arrival,
+          f.is_recommended
+        FROM model_forecasts f
+        JOIN model_outcomes o USING (forecast_id)
+        WHERE f.request_id IN ({placeholders_ids})
+        """,
+        request_ids_in_scope,
+    ).df()
+    if joined.empty:
+        for k in requested:
+            n_req = int((requests["plan_size"] == k).sum())
+            by_plan_size[int(k)] = {"plan_size": int(k), "n_requests": n_req, "model_leaderboard": []}
+        return {"window_hours": window_hours, "by_plan_size": by_plan_size}
+
+    joined = joined.merge(requests, on="request_id", how="left")
+    joined["observed_has_ebike"] = joined["observed_has_ebike"].astype(bool)
+    joined["p_has_ebike"] = joined["p_has_ebike"].astype(float).clip(0.001, 0.999)
+
+    for k in requested:
+        slice_df = joined[joined["plan_size"] == k]
+        n_req = int((requests["plan_size"] == k).sum())
+        if slice_df.empty:
+            by_plan_size[int(k)] = {"plan_size": int(k), "n_requests": n_req, "model_leaderboard": []}
+            continue
+        rows = []
+        for model_key, group in slice_df.groupby("model_key"):
+            row = _metric_row(group)
+            row["model_key"] = model_key
+            row["model_label"] = (
+                group["model_label"].dropna().iloc[0]
+                if group["model_label"].notna().any()
+                else model_key
+            )
+            rows.append(row)
+        rows.sort(key=lambda r: math.inf if r.get("rank_loss") is None else r["rank_loss"])
+        for rank, row in enumerate(rows, start=1):
+            row["rank"] = rank
+        by_plan_size[int(k)] = {
+            "plan_size": int(k),
+            "n_requests": n_req,
+            "model_leaderboard": rows,
+        }
+
+    return {"window_hours": window_hours, "by_plan_size": by_plan_size}
 
 
 def best_performing_model(

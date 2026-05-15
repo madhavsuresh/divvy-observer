@@ -229,6 +229,44 @@ def _prediction_performance(window_hours: int) -> dict:
 
 
 @st.cache_data(ttl=120)
+def _multi_bike_performance(window_hours: int) -> dict:
+    with db.session(read_only=True) as conn:
+        return model_eval.multi_bike_performance_summary(
+            conn,
+            window_hours=window_hours,
+            plan_sizes=(2, 3, 4, 5),
+            initialize_schema=False,
+        )
+
+
+@st.cache_data(ttl=120)
+def _model_metric_trend(model_key: str | None, days: int) -> pd.DataFrame:
+    """Per-model rolling Brier/N over the last N days for the trend sparkline."""
+    with db.session(read_only=True) as conn:
+        if model_key:
+            return conn.execute(
+                """
+                SELECT computed_at, brier_score, rank_loss, n
+                FROM model_metrics
+                WHERE group_key = 'model' AND group_value = ?
+                  AND computed_at > now() - (? * INTERVAL '1 day')
+                ORDER BY computed_at
+                """,
+                [model_key, days],
+            ).df()
+        return conn.execute(
+            """
+            SELECT computed_at, brier_score, rank_loss, n
+            FROM model_metrics
+            WHERE group_key = 'overall'
+              AND computed_at > now() - (? * INTERVAL '1 day')
+            ORDER BY computed_at
+            """,
+            [days],
+        ).df()
+
+
+@st.cache_data(ttl=120)
 def _model_artifacts() -> list[dict]:
     with db.session(read_only=True) as conn:
         return model_registry.list_artifacts(conn)
@@ -520,6 +558,426 @@ def _minutes_label(minutes: float | None) -> str:
     if minutes < 1:
         return "<1 min"
     return f"{minutes:.0f} min"
+
+
+BASELINE_MODEL_KEY = "logistic"
+
+
+def _skill_score(model_brier: float | None, baseline_brier: float | None) -> float | None:
+    """Brier skill score vs baseline. >0 = better than baseline, <0 = worse."""
+    if model_brier is None or baseline_brier is None:
+        return None
+    if pd.isna(model_brier) or pd.isna(baseline_brier):
+        return None
+    if baseline_brier <= 0:
+        return None
+    return 1.0 - float(model_brier) / float(baseline_brier)
+
+
+def _skill_label(skill: float | None) -> str:
+    if skill is None or pd.isna(skill):
+        return "—"
+    return f"{skill * 100:+.1f}%"
+
+
+def _calibration_label(ece: float | None) -> str:
+    if ece is None or pd.isna(ece):
+        return "—"
+    if ece <= 0.05:
+        return "good"
+    if ece <= 0.10:
+        return "ok"
+    return "off"
+
+
+def _pipeline_health(
+    perf: dict,
+    collector_health: dict | None = None,
+    system_status: dict | None = None,
+) -> tuple[str, str, str]:
+    """Return (status, headline, detail) for the model-pipeline health badge.
+
+    status: 'green' | 'yellow' | 'red'
+    """
+    leaderboard = perf.get("model_leaderboard") or []
+    total_resolved = sum(int(row.get("n") or 0) for row in leaderboard)
+    last_outcome_age_min = None
+    last_forecast_age_min = None
+    if system_status:
+        freshness = system_status.get("data_freshness") or {}
+        latest_station = freshness.get("latest_station_reported")
+        if latest_station:
+            last_forecast_age_min = _age_minutes(pd.Timestamp(latest_station))
+    if collector_health:
+        last_forecast_age_min = (
+            _age_minutes(collector_health.get("latest_station_reported"))
+            if collector_health.get("latest_station_reported") is not None
+            else last_forecast_age_min
+        )
+
+    if total_resolved == 0:
+        return (
+            "red",
+            "Pipeline broken — no outcomes resolved in last 24h",
+            "Forecasts may still be flowing, but the resolver hasn't attached observed outcomes. "
+            "Run the resolve-outcomes job manually to drain the backlog.",
+        )
+    if total_resolved < 100:
+        return (
+            "yellow",
+            f"Sparse signal — only {total_resolved} resolved outcomes in last 24h",
+            "Metrics are noisy at this sample size. Wait for the box to bake or trigger a snapshot.",
+        )
+    detail_bits = [f"{total_resolved:,} resolved outcomes"]
+    if last_forecast_age_min is not None and last_forecast_age_min < 60:
+        detail_bits.append(f"last station tick {last_forecast_age_min:.0f}m ago")
+    return (
+        "green",
+        f"Pipeline healthy · {total_resolved:,} resolved outcomes in last 24h",
+        " · ".join(detail_bits),
+    )
+
+
+def _render_health_badge(status: str, headline: str, detail: str) -> None:
+    color_map = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
+    icon = color_map.get(status, "⚪")
+    if status == "green":
+        st.success(f"{icon} **{headline}**\n\n{detail}")
+    elif status == "yellow":
+        st.warning(f"{icon} **{headline}**\n\n{detail}")
+    else:
+        st.error(f"{icon} **{headline}**\n\n{detail}")
+
+
+def _render_leaderboard_block(
+    leaderboard: list[dict],
+    *,
+    active_key: str | None,
+    best_key: str | None,
+    window_hours: int,
+    key_prefix: str,
+    scope_caption: str | None = None,
+) -> None:
+    """Render hero metrics + slim/full leaderboard for a leaderboard list.
+
+    Used by both the global "All forecasts" tab and the per-k multi-bike tabs.
+    No-op for empty leaderboards — caller should handle that case.
+    """
+    if not leaderboard:
+        return
+
+    leaderboard_df = pd.DataFrame(leaderboard)
+    baseline_row = next(
+        (row for row in leaderboard if str(row.get("model_key")) == BASELINE_MODEL_KEY),
+        None,
+    )
+    baseline_brier = baseline_row.get("brier_score") if baseline_row else None
+    leaderboard_df["skill_score"] = leaderboard_df["brier_score"].apply(
+        lambda b: _skill_score(b, baseline_brier)
+    )
+    leaderboard_df["calibration_label"] = leaderboard_df.get(
+        "ece", pd.Series([None] * len(leaderboard_df))
+    ).apply(_calibration_label)
+
+    active_row = leaderboard_df[leaderboard_df["model_key"] == active_key]
+    best_row = leaderboard_df[leaderboard_df["model_key"] == best_key]
+    # If the supplied best_key is not in this leaderboard slice (e.g. multi-bike
+    # subset where the global best didn't show up), fall back to the slice's
+    # top-ranked model so the hero still shows something useful.
+    if best_row.empty and not leaderboard_df.empty:
+        slice_best = leaderboard_df.sort_values(
+            by="skill_score", ascending=False, na_position="last"
+        ).iloc[0]
+        slice_best_key = str(slice_best.get("model_key"))
+        best_row = leaderboard_df[leaderboard_df["model_key"] == slice_best_key]
+        best_key = slice_best_key
+    active_label = (active_row.iloc[0]["model_label"] if not active_row.empty else (active_key or "—"))
+    best_label = (best_row.iloc[0]["model_label"] if not best_row.empty else (best_key or "—"))
+    active_skill = active_row.iloc[0]["skill_score"] if not active_row.empty else None
+    best_skill = best_row.iloc[0]["skill_score"] if not best_row.empty else None
+    active_n = int(active_row.iloc[0]["n"]) if not active_row.empty else 0
+
+    cols = st.columns(3)
+    cols[0].metric(
+        "Active model (driving recommendations)",
+        active_label,
+        _skill_label(active_skill),
+        help="Skill score vs the logistic baseline. Positive = better than baseline.",
+    )
+    cols[0].caption(f"{active_n:,} resolved · {window_hours}h window")
+
+    cols[1].metric(
+        "Best evaluated model",
+        best_label,
+        _skill_label(best_skill),
+        help="Lowest rank loss in this slice.",
+    )
+    if best_key and not best_row.empty:
+        cols[1].caption(f"{int(best_row.iloc[0]['n']):,} resolved")
+
+    if active_key and best_key and active_key == best_key:
+        cols[2].metric("Active = Best?", "✅ yes")
+        cols[2].caption("Active driver is the leader.")
+    elif active_key and best_key:
+        delta = None
+        if active_skill is not None and best_skill is not None:
+            delta = (best_skill - active_skill) * 100
+        cols[2].metric(
+            "Active = Best?",
+            "❌ no",
+            f"+{delta:.1f}pp better available" if delta is not None else None,
+            delta_color="inverse",
+        )
+        cols[2].caption(f"Best candidate: {best_label}")
+    else:
+        cols[2].metric("Active = Best?", "—")
+        cols[2].caption("Awaiting more resolved outcomes.")
+
+    if scope_caption:
+        st.caption(scope_caption)
+
+    show_all = st.toggle(
+        "Show all metrics",
+        value=False,
+        key=f"{key_prefix}_show_all",
+        help="Switch from the simplified view to the full per-model metric table.",
+    )
+
+    leaderboard_df = leaderboard_df.copy()
+    leaderboard_df["model_display"] = leaderboard_df.apply(
+        lambda r: (
+            ("🟢 " if str(r.get("model_key")) == active_key else "")
+            + ("🥇 " if str(r.get("model_key")) == best_key and str(r.get("model_key")) != active_key else "")
+            + str(r.get("model_label") or r.get("model_key") or "?")
+        ),
+        axis=1,
+    )
+    leaderboard_df = leaderboard_df.sort_values(
+        by="skill_score", ascending=False, na_position="last"
+    )
+
+    if not show_all:
+        slim_cols = [
+            "rank",
+            "model_display",
+            "n",
+            "skill_score",
+            "calibration_label",
+            "recommended_hit_rate",
+        ]
+        slim = leaderboard_df[[c for c in slim_cols if c in leaderboard_df.columns]].copy()
+        if "recommended_hit_rate" in slim.columns:
+            slim["recommended_hit_rate"] = slim["recommended_hit_rate"].map(_prob_label)
+        if "skill_score" in slim.columns:
+            slim["skill_score"] = slim["skill_score"].map(_skill_label)
+        st.dataframe(
+            slim,
+            hide_index=True,
+            column_config={
+                "rank": "Rank",
+                "model_display": "Model",
+                "n": st.column_config.NumberColumn("Resolved", format="%d"),
+                "skill_score": st.column_config.Column(
+                    "Skill vs baseline",
+                    help="Brier skill: 1 - model/baseline. Positive = better than the logistic baseline.",
+                ),
+                "calibration_label": "Calibration",
+                "recommended_hit_rate": "Top-pick hit rate",
+            },
+        )
+        st.caption(
+            f"Skill score uses **{BASELINE_MODEL_KEY}** as the baseline. "
+            "Calibration: good (ECE ≤ 0.05), ok (≤ 0.10), off (> 0.10). "
+            "Top-pick hit rate = how often the model's #1 recommendation actually had an eBike."
+        )
+    else:
+        full_cols = [
+            "rank",
+            "model_display",
+            "n",
+            "skill_score",
+            "rank_loss",
+            "brier_score",
+            "log_loss",
+            "ece",
+            "recommended_hit_rate",
+            "distance_adjusted_regret",
+            "decision_rank_loss",
+            "count_log_loss",
+            "crps",
+            "capacity_violation_rate",
+            "observed_rate",
+            "mean_prediction",
+        ]
+        full = leaderboard_df[[c for c in full_cols if c in leaderboard_df.columns]].copy()
+        for column in [
+            "recommended_hit_rate",
+            "capacity_violation_rate",
+            "observed_rate",
+            "mean_prediction",
+        ]:
+            if column in full.columns:
+                full[column] = full[column].map(_prob_label)
+        if "skill_score" in full.columns:
+            full["skill_score"] = full["skill_score"].map(_skill_label)
+        st.dataframe(
+            full,
+            hide_index=True,
+            column_config={
+                "rank": "Rank",
+                "model_display": "Model",
+                "n": "Resolved",
+                "skill_score": st.column_config.Column("Skill vs baseline"),
+                "rank_loss": st.column_config.NumberColumn("Rank loss", format="%.3f"),
+                "brier_score": st.column_config.NumberColumn("Brier", format="%.3f"),
+                "log_loss": st.column_config.NumberColumn("Log loss", format="%.3f"),
+                "ece": st.column_config.NumberColumn("ECE", format="%.3f"),
+                "recommended_hit_rate": "Top-pick hit",
+                "distance_adjusted_regret": st.column_config.NumberColumn("Regret", format="%.3f"),
+                "decision_rank_loss": st.column_config.NumberColumn("Decision loss", format="%.3f"),
+                "count_log_loss": st.column_config.NumberColumn("Count NLL", format="%.3f"),
+                "crps": st.column_config.NumberColumn("CRPS", format="%.3f"),
+                "capacity_violation_rate": "Cap. violation",
+                "observed_rate": "Observed hit",
+                "mean_prediction": "Mean P",
+            },
+        )
+
+
+def _render_active_model_charts(perf: dict, active_key: str | None, active_label: str) -> None:
+    """Calibration scatter + 7-day rank-loss trend for the active model."""
+    chart_cols = st.columns(2)
+
+    calibration = perf.get("calibration") or []
+    with chart_cols[0]:
+        st.markdown(f"**Calibration — active model ({active_label})**")
+        if calibration:
+            cal_df = pd.DataFrame(calibration)
+            ref = pd.DataFrame({"x": [0, 1], "y": [0, 1]})
+            chart = alt.Chart(cal_df).mark_circle(size=120, opacity=0.8).encode(
+                x=alt.X("mean_prediction:Q", title="Predicted probability", scale=alt.Scale(domain=[0, 1])),
+                y=alt.Y("observed_hit_rate:Q", title="Observed hit rate", scale=alt.Scale(domain=[0, 1])),
+                size=alt.Size("n:Q", title="N", scale=alt.Scale(range=[40, 400])),
+                tooltip=[
+                    alt.Tooltip("probability_band:N", title="Band"),
+                    alt.Tooltip("n:Q", title="N"),
+                    alt.Tooltip("mean_prediction:Q", format=".1%", title="Predicted"),
+                    alt.Tooltip("observed_hit_rate:Q", format=".1%", title="Observed"),
+                ],
+            )
+            line = alt.Chart(ref).mark_line(strokeDash=[4, 4], color="#888").encode(x="x:Q", y="y:Q")
+            st.altair_chart((line + chart).properties(height=200), use_container_width=True)
+            st.caption("Dots above the line = model under-predicts; below = over-predicts. Size = sample count.")
+        else:
+            st.info("Calibration data unavailable for this window.")
+
+    with chart_cols[1]:
+        st.markdown("**7-day rank-loss trend — active model**")
+        if active_key:
+            trend = _model_metric_trend(active_key, days=7)
+        else:
+            trend = pd.DataFrame()
+        if not trend.empty and trend["rank_loss"].notna().any():
+            trend_chart = alt.Chart(trend).mark_line(point=True).encode(
+                x=alt.X("computed_at:T", title=None),
+                y=alt.Y("rank_loss:Q", title="Rank loss", scale=alt.Scale(zero=False)),
+                tooltip=[
+                    alt.Tooltip("computed_at:T"),
+                    alt.Tooltip("rank_loss:Q", format=".3f"),
+                    alt.Tooltip("brier_score:Q", format=".3f"),
+                    alt.Tooltip("n:Q"),
+                ],
+            )
+            st.altair_chart(trend_chart.properties(height=200), use_container_width=True)
+            st.caption("Lower is better. Watch for upward drift = model degrading vs recent days.")
+        else:
+            st.info("Not enough snapshots yet for a 7-day trend.")
+
+
+MULTI_BIKE_PLAN_SIZES = (2, 3, 4, 5)
+
+
+def _model_performance_panel(perf: dict) -> None:
+    """Health-first model performance section.
+
+    Top-down: pipeline-health badge → tabs ("All forecasts" | k=2..5).
+    The "All forecasts" tab keeps the global hero + slim leaderboard +
+    calibration scatter + 7-day trend. Each k-tab evaluates models on the
+    candidate forecasts emitted under multi-bike-plan requests of that size.
+    """
+    leaderboard = perf.get("model_leaderboard") or []
+    try:
+        collector = _collector_health()
+    except Exception:
+        collector = {}
+    try:
+        sys_status = _system_status_payload().get("status", {})
+    except Exception:
+        sys_status = {}
+    status, headline, detail = _pipeline_health(perf, collector, sys_status)
+
+    st.markdown("### Model performance")
+    _render_health_badge(status, headline, detail)
+    if not leaderboard:
+        return
+
+    active_key = (perf.get("active_model") or {}).get("model_key")
+    best_key = (perf.get("best_current_model") or {}).get("model_key")
+    window_hours = int(perf.get("window_hours") or 24)
+
+    try:
+        multi = _multi_bike_performance(window_hours)
+    except Exception as exc:
+        multi = {"by_plan_size": {}, "_error": str(exc)}
+
+    tab_labels = ["All forecasts"] + [f"k={k} plans" for k in MULTI_BIKE_PLAN_SIZES]
+    tabs = st.tabs(tab_labels)
+
+    with tabs[0]:
+        _render_leaderboard_block(
+            leaderboard,
+            active_key=active_key,
+            best_key=best_key,
+            window_hours=window_hours,
+            key_prefix="model_perf_all",
+        )
+        # Use the active model's row label for the calibration heading, falling
+        # back to the active key if missing.
+        active_label = next(
+            (str(r.get("model_label") or r.get("model_key") or active_key)
+             for r in leaderboard if str(r.get("model_key")) == active_key),
+            active_key or "—",
+        )
+        _render_active_model_charts(perf, active_key, active_label)
+
+    by_plan_size = (multi or {}).get("by_plan_size") or {}
+    for tab, k in zip(tabs[1:], MULTI_BIKE_PLAN_SIZES):
+        with tab:
+            payload = by_plan_size.get(k) or {"n_requests": 0, "model_leaderboard": []}
+            n_req = int(payload.get("n_requests") or 0)
+            rows = payload.get("model_leaderboard") or []
+            if not rows or n_req == 0:
+                st.info(
+                    f"No multi-bike plans of size **k={k}** in the last {window_hours}h. "
+                    f"Trigger one to seed data:\n\n"
+                    f"```bash\ncurl -X POST http://127.0.0.1:8000/api/v1/multi_bike_plan \\\n"
+                    f"  -H 'Content-Type: application/json' \\\n"
+                    f"  -d '{{\"lat\": 41.88, \"lon\": -87.63, \"k\": {k}}}'\n```"
+                )
+                continue
+            scope_caption = (
+                f"Evaluating **all candidate forecasts** logged for {n_req:,} multi-bike "
+                f"plan{'s' if n_req != 1 else ''} of size k={k} in the last {window_hours}h. "
+                "Each model is scored on the same candidate pool, so the comparison is apples-to-apples."
+            )
+            _render_leaderboard_block(
+                rows,
+                active_key=active_key,
+                best_key=best_key,
+                window_hours=window_hours,
+                key_prefix=f"model_perf_k{k}",
+                scope_caption=scope_caption,
+            )
 
 
 def _model_status_banner(perf: dict, model_payload: dict) -> None:
@@ -1439,60 +1897,7 @@ def _prediction_service_section(lat: float, lon: float) -> None:
                 },
             )
 
-    leaderboard = pd.DataFrame(perf.get("model_leaderboard") or [])
-    if not leaderboard.empty:
-        with st.expander("Rolling model leaderboard", expanded=True):
-            st.caption("Models are ranked by rank loss = Brier score + 0.05 × log loss; lower is better.")
-            leaderboard_columns = [
-                "rank",
-                "model_label",
-                "n",
-                "rank_loss",
-                "brier_score",
-                "log_loss",
-                "count_log_loss",
-                "crps",
-                "ece",
-                "recommended_hit_rate",
-                "distance_adjusted_regret",
-                "decision_rank_loss",
-                "capacity_violation_rate",
-                "dock_constrained_arrival_rate",
-                "observed_rate",
-                "mean_prediction",
-            ]
-            leaderboard_display = leaderboard[[column for column in leaderboard_columns if column in leaderboard.columns]].copy()
-            for column in [
-                "recommended_hit_rate",
-                "capacity_violation_rate",
-                "dock_constrained_arrival_rate",
-                "observed_rate",
-                "mean_prediction",
-            ]:
-                if column in leaderboard_display.columns:
-                    leaderboard_display[column] = leaderboard_display[column].map(_prob_label)
-            st.dataframe(
-                leaderboard_display,
-                hide_index=True,
-                column_config={
-                    "rank": "Rank",
-                    "model_label": "Model",
-                    "n": "Resolved forecasts",
-                    "rank_loss": st.column_config.NumberColumn("Rank loss", format="%.3f"),
-                    "brier_score": st.column_config.NumberColumn("Brier", format="%.3f"),
-                    "log_loss": st.column_config.NumberColumn("Log loss", format="%.3f"),
-                    "count_log_loss": st.column_config.NumberColumn("Count NLL", format="%.3f"),
-                    "crps": st.column_config.NumberColumn("CRPS", format="%.3f"),
-                    "ece": st.column_config.NumberColumn("ECE", format="%.3f"),
-                    "recommended_hit_rate": "Recommended hit rate",
-                    "distance_adjusted_regret": st.column_config.NumberColumn("Regret", format="%.3f"),
-                    "decision_rank_loss": st.column_config.NumberColumn("Decision loss", format="%.3f"),
-                    "capacity_violation_rate": "Capacity violation",
-                    "dock_constrained_arrival_rate": "Dock constrained",
-                    "observed_rate": "Observed hit rate",
-                    "mean_prediction": "Mean prediction",
-                },
-            )
+    _model_performance_panel(perf)
 
     artifacts = pd.DataFrame(_model_artifacts())
     if not artifacts.empty:
