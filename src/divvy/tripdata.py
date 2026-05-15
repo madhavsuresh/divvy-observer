@@ -17,6 +17,16 @@ from . import db
 DIVVY_TRIPDATA_BASE_URL = "https://divvy-tripdata.s3.amazonaws.com"
 LOCAL_TZ = "America/Chicago"
 CHUNK_SIZE = 150_000
+# Earliest year/month that uses the modern monthly ZIP naming + schema.
+# Files before April 2020 use a different naming scheme (Divvy_Trips_YYYY_QX.zip)
+# AND a different column schema (trip_id, starttime, ...) — those would need a
+# separate normalize path. The modern schema is what every model in this repo
+# expects, so we backfill from the first available month onward.
+S3_MONTHLY_FORMAT_FROM = (2020, 4)
+# Treat a month as "already loaded" if we have at least this many trips for it.
+# Real months are >100k trips, so 1k is a generous floor that still catches
+# mostly-empty partial loads from interrupted past runs.
+MIN_TRIPS_FOR_LOADED_MONTH = 1000
 
 
 @dataclass(frozen=True)
@@ -271,6 +281,95 @@ def sync_recent_months(conn: duckdb.DuckDBPyConnection, months: int = 3) -> list
     return results
 
 
+def all_completed_months_since(
+    start: tuple[int, int] = S3_MONTHLY_FORMAT_FROM,
+    end: date | None = None,
+) -> list[tuple[int, int]]:
+    """Every (year, month) from ``start`` through the most recently completed month."""
+    anchor = end or date.today()
+    end_first = date(anchor.year, anchor.month, 1) - timedelta(days=1)
+    months: list[tuple[int, int]] = []
+    cursor = date(start[0], start[1], 1)
+    while cursor <= end_first:
+        months.append((cursor.year, cursor.month))
+        if cursor.month == 12:
+            cursor = date(cursor.year + 1, 1, 1)
+        else:
+            cursor = date(cursor.year, cursor.month + 1, 1)
+    return months
+
+
+def months_already_loaded(
+    conn: duckdb.DuckDBPyConnection, *, min_trips: int = MIN_TRIPS_FOR_LOADED_MONTH
+) -> set[tuple[int, int]]:
+    """Months in ``divvy_trips`` with at least ``min_trips`` rows.
+
+    Used to skip re-downloading months we've already ingested. We use the
+    started_at field (UTC); month boundaries can shift a few hours of trips
+    into the neighboring month vs. local time, but for a "have we loaded
+    this?" gate that's negligible.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+          CAST(EXTRACT(YEAR FROM started_at) AS INTEGER) AS y,
+          CAST(EXTRACT(MONTH FROM started_at) AS INTEGER) AS m,
+          COUNT(*) AS n
+        FROM divvy_trips
+        WHERE started_at IS NOT NULL
+        GROUP BY y, m
+        HAVING COUNT(*) >= ?
+        """,
+        [int(min_trips)],
+    ).fetchall()
+    return {(int(y), int(m)) for y, m, _ in rows}
+
+
+def sync_range(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    start: tuple[int, int] = S3_MONTHLY_FORMAT_FROM,
+    end: date | None = None,
+    skip_existing: bool = True,
+    rebuild_flows: bool = True,
+    on_progress=None,
+) -> list[TripIngestResult]:
+    """Backfill all monthly archives in [start, latest completed month].
+
+    - Skips months that already have >= MIN_TRIPS_FOR_LOADED_MONTH trips loaded
+      (so re-running is cheap and idempotent — only new months hit S3).
+    - Skips months whose ZIP returns 404 (S3 hasn't published it yet).
+    - Defers ``rebuild_flow_tables`` until the end so we don't pay the
+      O(divvy_trips) cost N times during a backfill.
+
+    Returns the per-month TripIngestResult for every month we actually
+    attempted to download (skipped months are not in the list).
+    """
+    months = all_completed_months_since(start, end=end)
+    if skip_existing:
+        loaded = months_already_loaded(conn)
+        months = [m for m in months if m not in loaded]
+    results: list[TripIngestResult] = []
+    for year, month in months:
+        try:
+            result = download_month(conn, year, month)
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 404:
+                # S3 doesn't have this month yet (recent month not published,
+                # or older month that pre-dates the modern naming scheme).
+                if on_progress is not None:
+                    on_progress(year, month, None, "missing")
+                continue
+            raise
+        results.append(result)
+        if on_progress is not None:
+            on_progress(year, month, result, "ok")
+    if rebuild_flows and results:
+        rebuild_flow_tables(conn)
+    return results
+
+
 def _format_results(results: Iterable[TripIngestResult]) -> str:
     lines = []
     for result in results:
@@ -286,6 +385,27 @@ def main(argv: list[str] | None = None) -> int:
     sync = sub.add_parser("sync", help="Download and ingest recent completed monthly trip archives.")
     sync.add_argument("--months", type=int, default=3)
 
+    sync_all = sub.add_parser(
+        "sync-all",
+        help="Backfill every monthly archive from start month through the latest completed month.",
+    )
+    sync_all.add_argument("--start-year", type=int, default=S3_MONTHLY_FORMAT_FROM[0])
+    sync_all.add_argument("--start-month", type=int, default=S3_MONTHLY_FORMAT_FROM[1])
+    sync_all.add_argument(
+        "--no-skip-existing",
+        dest="skip_existing",
+        action="store_false",
+        default=True,
+        help="Re-download months that are already loaded (default: skip).",
+    )
+    sync_all.add_argument(
+        "--no-rebuild-flows",
+        dest="rebuild_flows",
+        action="store_false",
+        default=True,
+        help="Skip the post-download rebuild of station_trip_flows / station_trip_routes.",
+    )
+
     ingest = sub.add_parser("ingest-file", help="Ingest a local Divvy trip-data ZIP file.")
     ingest.add_argument("path", type=Path)
     ingest.add_argument("--month")
@@ -298,6 +418,29 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "sync":
             results = sync_recent_months(conn, months=args.months)
             print(_format_results(results))
+        elif args.command == "sync-all":
+            def _progress(year, month, result, status):
+                if status == "ok" and result is not None:
+                    print(
+                        f"{year}-{month:02d}: inserted {result.rows_inserted:,} of "
+                        f"{result.rows_seen:,} rows",
+                        flush=True,
+                    )
+                elif status == "missing":
+                    print(f"{year}-{month:02d}: not on S3 (skipped)", flush=True)
+            results = sync_range(
+                conn,
+                start=(int(args.start_year), int(args.start_month)),
+                skip_existing=bool(args.skip_existing),
+                rebuild_flows=bool(args.rebuild_flows),
+                on_progress=_progress,
+            )
+            total_inserted = sum(r.rows_inserted for r in results)
+            total_seen = sum(r.rows_seen for r in results)
+            print(
+                f"\nDONE: {len(results)} months ingested, "
+                f"{total_inserted:,} rows inserted of {total_seen:,} seen."
+            )
         elif args.command == "ingest-file":
             result = ingest_zip(conn, args.path, month=args.month)
             flow = rebuild_flow_tables(conn)

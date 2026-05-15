@@ -78,6 +78,10 @@ def default_scheduler() -> Scheduler:
             ScheduledJob("snapshot-metrics", interval_seconds=config.METRIC_SNAPSHOT_INTERVAL_SECONDS),
             ScheduledJob("select-model", interval_seconds=3600),
             ScheduledJob("cleanup", interval_seconds=3600),
+            # Pull the previous month's Divvy historical trip dump once a day
+            # (Divvy publishes around the 10th — running daily catches it
+            # within ~24h without re-downloading anything we already have).
+            ScheduledJob("sync-tripdata", interval_seconds=24 * 3600),
             ScheduledJob("train-nightly", local_time=_parse_local_time(config.NIGHTLY_TRAIN_LOCAL_TIME)),
             ScheduledJob(
                 "train-weekly",
