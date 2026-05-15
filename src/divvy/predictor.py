@@ -20,7 +20,7 @@ except Exception:
     _torch_nn = None
 
 LOCAL_TZ = "America/Chicago"
-HORIZONS = (5, 10, 15, 20)
+HORIZONS = (5, 10, 15, 20, 30, 45, 60, 90)
 MODEL_VERSION = "inventory-world-v2"
 BASELINE_VERSION = "empirical-bayes-v1"
 SOTA_PRIMARY_MODEL_KEYS = (
@@ -423,13 +423,22 @@ def _finite_float(value, default: float = 0.0) -> float:
 
 
 def cold_start_cap(current_ebikes: int, horizon_minutes: int) -> float:
+    # Caps prevent over-confident bootstrap/cold-start predictions. They only
+    # bind when the active model is fallback or has < 1000 resolved outcomes
+    # (see apply_cold_start_probability_guard). For empty stations the cap
+    # rises with horizon (more time for an arrival); for occupied stations
+    # the cap falls with horizon (more time for a pickup).
     if current_ebikes <= 0:
-        return {5: 0.45, 10: 0.55, 15: 0.65, 20: 0.72}.get(horizon_minutes, 0.60)
+        return {5: 0.45, 10: 0.55, 15: 0.65, 20: 0.72,
+                30: 0.78, 45: 0.84, 60: 0.88, 90: 0.93}.get(horizon_minutes, 0.80)
     if current_ebikes == 1:
-        return {5: 0.88, 10: 0.84, 15: 0.80, 20: 0.76}.get(horizon_minutes, 0.82)
+        return {5: 0.88, 10: 0.84, 15: 0.80, 20: 0.76,
+                30: 0.68, 45: 0.60, 60: 0.55, 90: 0.50}.get(horizon_minutes, 0.65)
     if current_ebikes == 2:
-        return {5: 0.95, 10: 0.92, 15: 0.89, 20: 0.86}.get(horizon_minutes, 0.90)
-    return {5: 0.985, 10: 0.970, 15: 0.955, 20: 0.940}.get(horizon_minutes, 0.955)
+        return {5: 0.95, 10: 0.92, 15: 0.89, 20: 0.86,
+                30: 0.80, 45: 0.74, 60: 0.68, 90: 0.62}.get(horizon_minutes, 0.78)
+    return {5: 0.985, 10: 0.970, 15: 0.955, 20: 0.940,
+            30: 0.910, 45: 0.870, 60: 0.830, 90: 0.770}.get(horizon_minutes, 0.880)
 
 
 def apply_cold_start_probability_guard(
