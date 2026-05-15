@@ -256,6 +256,52 @@ def _empty_station_performance(window_hours: int) -> dict:
 
 
 @st.cache_data(ttl=120)
+def _count_performance(window_hours: int) -> dict:
+    with db.session(read_only=True) as conn:
+        return model_eval.count_performance_summary(
+            conn, window_hours=window_hours, initialize_schema=False
+        )
+
+
+@st.cache_data(ttl=120)
+def _threshold_k_performance(window_hours: int) -> dict:
+    with db.session(read_only=True) as conn:
+        return model_eval.threshold_k_performance_summary(
+            conn,
+            window_hours=window_hours,
+            k_values=(1, 2, 3, 5),
+            initialize_schema=False,
+        )
+
+
+@st.cache_data(ttl=120)
+def _open_dock_performance(window_hours: int) -> dict:
+    with db.session(read_only=True) as conn:
+        return model_eval.open_dock_performance_summary(
+            conn, window_hours=window_hours, initialize_schema=False
+        )
+
+
+@st.cache_data(ttl=120)
+def _topk_recommendation_performance(window_hours: int) -> dict:
+    with db.session(read_only=True) as conn:
+        return model_eval.topk_recommendation_summary(
+            conn,
+            window_hours=window_hours,
+            k_values=(1, 3, 5),
+            initialize_schema=False,
+        )
+
+
+@st.cache_data(ttl=120)
+def _survival_calibration(window_hours: int) -> dict:
+    with db.session(read_only=True) as conn:
+        return model_eval.survival_calibration_summary(
+            conn, window_hours=window_hours, initialize_schema=False
+        )
+
+
+@st.cache_data(ttl=120)
 def _model_metric_trend(model_key: str | None, days: int) -> pd.DataFrame:
     """Per-model rolling Brier/N over the last N days for the trend sparkline."""
     with db.session(read_only=True) as conn:
@@ -1065,6 +1111,323 @@ def _render_empty_station_tab(
     )
 
 
+def _render_count_tab(window_hours: int, active_key: str | None) -> None:
+    """Count prediction leaderboard — NLL, CRPS, MAE on E[count].
+
+    Models that don't emit a count PMF (RF/GB/logistic/empirical/stg_ncde)
+    are still listed but with NLL/CRPS = '—'. They can still be ranked on
+    MAE if they emit expected_ebikes.
+    """
+    try:
+        payload = _count_performance(window_hours)
+    except Exception as exc:
+        st.error(f"count query failed: {exc}")
+        return
+    rows = payload.get("model_leaderboard") or []
+    if not rows:
+        st.info(f"No resolved forecasts in the last {window_hours}h.")
+        return
+    df = pd.DataFrame(rows)
+    df["model_display"] = df.apply(
+        lambda r: ("🟢 " if str(r.get("model_key")) == active_key else "")
+        + str(r.get("model_label") or r.get("model_key")),
+        axis=1,
+    )
+    st.markdown(
+        f"**Count prediction — last {window_hours}h.** "
+        "Headline metric is **count NLL** (lower = better) — the negative log-likelihood "
+        "of the *integer* observed count under the model's PMF. CRPS scores the full "
+        "distribution. MAE on E[count] gives a more legible point-prediction error."
+    )
+    avg_obs = float(df["mean_observed_ebikes"].mean()) if df["mean_observed_ebikes"].notna().any() else None
+    if avg_obs is not None:
+        st.caption(
+            f"Mean observed eBike count across resolved forecasts: **{avg_obs:.2f}**. "
+            "Models that don't emit a PMF (logistic / RF / gradient_boosting / empirical / "
+            "stg_ncde_inventory) show — for NLL/CRPS but can still be scored on MAE if they "
+            "emit expected_ebikes."
+        )
+    display_cols = [
+        "rank",
+        "model_display",
+        "n",
+        "n_with_pmf",
+        "count_nll",
+        "crps",
+        "mae_expected",
+        "rmse_expected",
+    ]
+    show = df[display_cols].copy()
+    st.dataframe(
+        show,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "rank": "Rank",
+            "model_display": "Model",
+            "n": st.column_config.NumberColumn("Resolved", format="%d"),
+            "n_with_pmf": st.column_config.NumberColumn("With PMF", format="%d"),
+            "count_nll": st.column_config.NumberColumn("Count NLL", format="%.3f"),
+            "crps": st.column_config.NumberColumn("CRPS", format="%.3f"),
+            "mae_expected": st.column_config.NumberColumn("MAE (E[count])", format="%.3f"),
+            "rmse_expected": st.column_config.NumberColumn("RMSE", format="%.3f"),
+        },
+    )
+
+
+def _render_threshold_k_tab(window_hours: int, active_key: str | None) -> None:
+    """Brier score for P(observed_ebikes >= k) for k ∈ {1, 2, 3, 5}.
+
+    Lets you see how predictive each model is at different decision thresholds
+    a planner might care about (single bike, multi-bike, surge-fleet, etc.).
+    """
+    try:
+        payload = _threshold_k_performance(window_hours)
+    except Exception as exc:
+        st.error(f"threshold-k query failed: {exc}")
+        return
+    by_k = payload.get("by_k") or {}
+    k_values = payload.get("k_values") or []
+    if not by_k:
+        st.info(
+            f"No PMF-emitting forecasts in last {window_hours}h. Threshold-K needs models "
+            "that ship a count distribution (cc_nissm, tft_inventory, inventory_world, "
+            "macflow_nissm_lite, dg_nissm)."
+        )
+        return
+
+    # Long dataframe for chart
+    long_rows: list[dict] = []
+    for k in k_values:
+        for r in by_k.get(k, {}).get("model_leaderboard", []):
+            long_rows.append({
+                "k": int(k),
+                "model_key": r.get("model_key"),
+                "model_label": r.get("model_label"),
+                "brier": r.get("brier_score"),
+                "n": r.get("n"),
+                "observed_rate": r.get("observed_rate"),
+            })
+    long_df = pd.DataFrame(long_rows)
+    if long_df.empty:
+        st.info("No threshold-k data yet.")
+        return
+
+    st.markdown(
+        f"**P(observed_ebikes ≥ k) Brier — last {window_hours}h.** "
+        "Different decision thresholds for different planner needs: k=1 is the basic "
+        '"any bike?" question, k=2..3 is a small group, k=5 is a fleet ask. '
+        "Lower Brier = sharper, better-calibrated probability at that threshold."
+    )
+    chart = (
+        alt.Chart(long_df.dropna(subset=["brier"]))
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("k:O", title="Threshold k"),
+            y=alt.Y("brier:Q", title="Brier (lower is better)", scale=alt.Scale(zero=False)),
+            color=alt.Color("model_label:N", title="Model"),
+            tooltip=[
+                alt.Tooltip("model_label:N", title="Model"),
+                alt.Tooltip("k:O", title="k"),
+                alt.Tooltip("brier:Q", format=".4f", title="Brier"),
+                alt.Tooltip("observed_rate:Q", format=".3f", title="Base rate"),
+                alt.Tooltip("n:Q", title="N"),
+            ],
+        )
+        .properties(height=260)
+    )
+    st.altair_chart(chart, use_container_width=True)
+    base_rates = (
+        long_df.groupby("k")["observed_rate"].first().to_dict()
+        if "observed_rate" in long_df.columns
+        else {}
+    )
+    if base_rates:
+        bits = " · ".join(f"k={k}: {rate * 100:.1f}%" for k, rate in sorted(base_rates.items()))
+        st.caption(f"Empirical base rates: {bits}")
+
+
+def _render_open_dock_tab(window_hours: int, active_key: str | None) -> None:
+    """Per-model leaderboard for the parking-side dual of has-eBike."""
+    try:
+        payload = _open_dock_performance(window_hours)
+    except Exception as exc:
+        st.error(f"open-dock query failed: {exc}")
+        return
+    rows = payload.get("model_leaderboard") or []
+    n_total = int(payload.get("n_total") or 0)
+    open_rate = payload.get("open_rate")
+    if not rows or n_total == 0:
+        st.info(
+            f"No models emitted p_capacity_violation in the last {window_hours}h. "
+            "This metric is only populated by SOTA / inventory-world family models."
+        )
+        return
+    headline_bits = [f"{n_total:,} resolved forecasts with p_capacity_violation"]
+    if open_rate is not None:
+        headline_bits.append(f"open-dock rate {open_rate * 100:.1f}%")
+    st.markdown(
+        f"**Open dock prediction — last {window_hours}h** ({' · '.join(headline_bits)}). "
+        "Uses **(1 − p_capacity_violation)** as the predicted probability that a returning "
+        "rider will find an open dock at horizon t. Target = (observed_docks > 0). This is "
+        "a proxy for the eventual first-class p_has_open_dock target that's flagged as a "
+        "TODO on the cdg_nmip side; the dual of the existing P(has eBike) prediction."
+    )
+    df = pd.DataFrame(rows)
+    df["model_display"] = df.apply(
+        lambda r: ("🟢 " if str(r.get("model_key")) == active_key else "")
+        + str(r.get("model_label") or r.get("model_key")),
+        axis=1,
+    )
+    df["mean_prediction"] = df["mean_prediction"].map(_prob_label)
+    df["observed_rate"] = df["observed_rate"].map(_prob_label)
+    st.dataframe(
+        df[["rank", "model_display", "n", "brier_score", "log_loss", "mean_prediction", "observed_rate"]],
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "rank": "Rank",
+            "model_display": "Model",
+            "n": st.column_config.NumberColumn("Resolved", format="%d"),
+            "brier_score": st.column_config.NumberColumn("Brier", format="%.4f"),
+            "log_loss": st.column_config.NumberColumn("Log loss", format="%.3f"),
+            "mean_prediction": "Mean P(open)",
+            "observed_rate": "Observed P(open)",
+        },
+    )
+    st.caption(
+        "When the open-dock rate is very high (most stations have docks most of the time), "
+        "differences in Brier between models are small in absolute terms but still proxy for "
+        "the harder cases (near-full stations) where the prediction matters most."
+    )
+
+
+def _render_topk_recommendation_tab(window_hours: int, active_key: str | None) -> None:
+    """Top-K hit-rate over real recommendation requests."""
+    try:
+        payload = _topk_recommendation_performance(window_hours)
+    except Exception as exc:
+        st.error(f"top-k query failed: {exc}")
+        return
+    rows = payload.get("model_leaderboard") or []
+    k_values = payload.get("k_values") or []
+    if not rows:
+        st.info(
+            f"No resolvable recommendation requests in the last {window_hours}h. "
+            "This benchmark needs `source LIKE 'api%'` requests (real recommend / "
+            "multi_bike_plan calls) with resolved outcomes."
+        )
+        return
+    n_req = max(int(r.get("n_requests") or 0) for r in rows)
+    st.markdown(
+        f"**Top-K recommendation accuracy — last {window_hours}h.** "
+        "For each request, the *actually-best* station is the one that ended up with "
+        "the most observed eBikes at the 10-minute horizon. A model gets credit if its "
+        "top-K recommended_rank picks include that best station. This measures decision "
+        "quality, not just probability quality."
+    )
+    if n_req < 10:
+        st.warning(
+            f"Thin sample — only {n_req} resolvable request{'s' if n_req != 1 else ''} "
+            "in this window. Hit rates will jump around until traffic accumulates. "
+            "Trigger requests to seed: `curl -X POST .../api/v1/recommendations` "
+            "or `.../api/v1/multi_bike_plan`."
+        )
+    df = pd.DataFrame(rows)
+    df["model_display"] = df.apply(
+        lambda r: ("🟢 " if str(r.get("model_key")) == active_key else "")
+        + str(r.get("model_label") or r.get("model_key")),
+        axis=1,
+    )
+    cols = ["rank", "model_display", "n_requests"] + [f"top{k}_hit_rate" for k in k_values]
+    rename = {f"top{k}_hit_rate": f"Top-{k}" for k in k_values}
+    show = df[cols].copy()
+    for k in k_values:
+        show[f"top{k}_hit_rate"] = show[f"top{k}_hit_rate"].map(_prob_label)
+    show = show.rename(columns=rename)
+    show.rename(columns={"rank": "Rank", "model_display": "Model", "n_requests": "Requests"}, inplace=True)
+    st.dataframe(show, hide_index=True, use_container_width=True)
+
+
+def _render_survival_tab(window_hours: int, active_key: str | None) -> None:
+    """Empty-station survival curves: predicted vs observed P(still empty at h)."""
+    try:
+        payload = _survival_calibration(window_hours)
+    except Exception as exc:
+        st.error(f"survival query failed: {exc}")
+        return
+    rows = payload.get("by_horizon_model") or []
+    horizons = payload.get("horizons") or []
+    if not rows or not horizons:
+        st.info(f"No empty-station forecasts in the last {window_hours}h.")
+        return
+    st.markdown(
+        f"**Empty-station survival — last {window_hours}h.** "
+        "For forecasts where current_ebikes == 0, the *survival probability* is "
+        "P(still empty at horizon h) = 1 − P(has eBike at h). Solid lines = each "
+        "model's predicted average. Dashed black line = observed reality. "
+        "Lines that hug the black line are well-calibrated arrival models."
+    )
+    df = pd.DataFrame(rows)
+
+    # Build chart: predicted (one line per model) + observed (single dashed black line)
+    predicted = df[["model_label", "horizon_minutes", "predicted_still_empty"]].rename(
+        columns={"predicted_still_empty": "value"}
+    )
+    predicted["series"] = predicted["model_label"]
+    observed_per_h = (
+        df.groupby("horizon_minutes")["observed_still_empty"].mean().reset_index()
+    )
+    observed_per_h["series"] = "OBSERVED"
+    observed_per_h = observed_per_h.rename(columns={"observed_still_empty": "value"})
+
+    pred_chart = (
+        alt.Chart(predicted)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("horizon_minutes:Q", title="Horizon (min)"),
+            y=alt.Y("value:Q", title="P(still empty)", scale=alt.Scale(domain=[0, 1])),
+            color=alt.Color("series:N", title="Model"),
+            tooltip=[
+                alt.Tooltip("series:N", title="Model"),
+                alt.Tooltip("horizon_minutes:Q", title="Horizon"),
+                alt.Tooltip("value:Q", format=".3f"),
+            ],
+        )
+    )
+    obs_chart = (
+        alt.Chart(observed_per_h)
+        .mark_line(strokeDash=[6, 4], color="black", size=3)
+        .encode(
+            x=alt.X("horizon_minutes:Q"),
+            y=alt.Y("value:Q"),
+            tooltip=[
+                alt.Tooltip("series:N", title=" "),
+                alt.Tooltip("horizon_minutes:Q", title="Horizon"),
+                alt.Tooltip("value:Q", format=".3f", title="Observed"),
+            ],
+        )
+    )
+    st.altair_chart((pred_chart + obs_chart).properties(height=300), use_container_width=True)
+
+    st.markdown("**Per-horizon Brier (lower is better)**")
+    pivot = df.pivot_table(
+        index=["model_label"],
+        columns="horizon_minutes",
+        values="brier",
+        aggfunc="mean",
+    ).reset_index()
+    pivot.columns = [str(c) if not isinstance(c, str) else c for c in pivot.columns]
+    rename = {str(h): f"h={h}m" for h in horizons}
+    pivot = pivot.rename(columns=rename)
+    st.dataframe(pivot, hide_index=True, use_container_width=True)
+    st.caption(
+        "Models that systematically predict survival far below the observed line (e.g. "
+        "predicting bikes will arrive when they don't) are over-confident on arrivals; "
+        "those above the line are too pessimistic."
+    )
+
+
 def _model_performance_panel(perf: dict) -> None:
     """Health-first model performance section.
 
@@ -1102,6 +1465,7 @@ def _model_performance_panel(perf: dict) -> None:
         ["All forecasts"]
         + [f"k={k} plans" for k in MULTI_BIKE_PLAN_SIZES]
         + ["By horizon", "Empty stations"]
+        + ["Count", "P(≥k)", "Open dock", "Top-K rec.", "Survival"]
     )
     tabs = st.tabs(tab_labels)
 
@@ -1154,10 +1518,25 @@ def _model_performance_panel(perf: dict) -> None:
 
     by_horizon_tab = tabs[1 + multi_tab_count]
     empty_station_tab = tabs[2 + multi_tab_count]
+    count_tab = tabs[3 + multi_tab_count]
+    threshold_tab = tabs[4 + multi_tab_count]
+    open_dock_tab = tabs[5 + multi_tab_count]
+    topk_tab = tabs[6 + multi_tab_count]
+    survival_tab = tabs[7 + multi_tab_count]
     with by_horizon_tab:
         _render_by_horizon_tab(window_hours, active_key, best_key)
     with empty_station_tab:
         _render_empty_station_tab(window_hours, active_key, best_key)
+    with count_tab:
+        _render_count_tab(window_hours, active_key)
+    with threshold_tab:
+        _render_threshold_k_tab(window_hours, active_key)
+    with open_dock_tab:
+        _render_open_dock_tab(window_hours, active_key)
+    with topk_tab:
+        _render_topk_recommendation_tab(window_hours, active_key)
+    with survival_tab:
+        _render_survival_tab(window_hours, active_key)
 
 
 def _model_status_banner(perf: dict, model_payload: dict) -> None:

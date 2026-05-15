@@ -1075,6 +1075,421 @@ def multi_bike_performance_summary(
     return {"window_hours": window_hours, "by_plan_size": by_plan_size}
 
 
+def count_performance_summary(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window_hours: int = 24,
+    initialize_schema: bool = True,
+) -> dict:
+    """Per-model leaderboard for *count* prediction (not just binary has-bike).
+
+    Sorted by count NLL (lower = better). Models that don't emit a count PMF
+    (random_forest, gradient_boosting, logistic, empirical, stg_ncde_inventory)
+    have NLL/CRPS = None and are dropped from the leaderboard. MAE on
+    expected_ebikes vs observed_ebikes is computed for any model that emits
+    expected_ebikes — this lets us judge point-prediction quality even for
+    models that don't ship a full PMF.
+    """
+    if initialize_schema:
+        init_schema(conn)
+    df = conn.execute(
+        """
+        SELECT
+          f.model_key,
+          COALESCE(f.model_label, f.model_version) AS model_label,
+          f.expected_ebikes,
+          o.observed_ebikes,
+          o.count_log_prob,
+          o.crps
+        FROM model_forecasts f JOIN model_outcomes o USING (forecast_id)
+        WHERE f.forecasted_at > now() - (? * INTERVAL '1 hour')
+        """,
+        [window_hours],
+    ).df()
+    if df.empty:
+        return {"window_hours": window_hours, "model_leaderboard": []}
+
+    rows = []
+    for model_key, group in df.groupby("model_key"):
+        with_pmf = group.dropna(subset=["count_log_prob"])
+        with_expected = group.dropna(subset=["expected_ebikes", "observed_ebikes"])
+        n = int(len(group))
+        n_pmf = int(len(with_pmf))
+        n_mae = int(len(with_expected))
+        nll = float(with_pmf["count_log_prob"].mean()) if n_pmf else None
+        crps = float(with_pmf["crps"].mean()) if n_pmf else None
+        mae = (
+            float((with_expected["expected_ebikes"] - with_expected["observed_ebikes"]).abs().mean())
+            if n_mae
+            else None
+        )
+        rmse = (
+            float(((with_expected["expected_ebikes"] - with_expected["observed_ebikes"]) ** 2).mean() ** 0.5)
+            if n_mae
+            else None
+        )
+        rows.append({
+            "model_key": model_key,
+            "model_label": (
+                group["model_label"].dropna().iloc[0]
+                if group["model_label"].notna().any()
+                else model_key
+            ),
+            "n": n,
+            "n_with_pmf": n_pmf,
+            "n_with_expected": n_mae,
+            "count_nll": nll,
+            "crps": crps,
+            "mae_expected": mae,
+            "rmse_expected": rmse,
+            "mean_observed_ebikes": float(group["observed_ebikes"].mean()),
+        })
+    rows.sort(
+        key=lambda r: (
+            math.inf if r["count_nll"] is None else r["count_nll"],
+            math.inf if r["mae_expected"] is None else r["mae_expected"],
+        )
+    )
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    return {"window_hours": window_hours, "model_leaderboard": rows}
+
+
+def threshold_k_performance_summary(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window_hours: int = 24,
+    k_values: tuple[int, ...] = (1, 2, 3, 5),
+    initialize_schema: bool = True,
+) -> dict:
+    """For each k, evaluate P(observed_ebikes >= k) Brier per model.
+
+    The threshold probability is derived from p_count_ebikes_json
+    (PMF bins "0".."4" plus "5_plus"). Only models that emit a PMF appear in
+    the leaderboard. Returned shape mirrors per_horizon_performance_summary:
+        {
+          "window_hours": int,
+          "k_values": [int, ...],
+          "by_k": {k: {"k": k, "n_total": int, "model_leaderboard": [...]}},
+        }
+    """
+    if initialize_schema:
+        init_schema(conn)
+    df = conn.execute(
+        """
+        SELECT
+          f.model_key,
+          COALESCE(f.model_label, f.model_version) AS model_label,
+          f.p_count_ebikes_json,
+          o.observed_ebikes
+        FROM model_forecasts f JOIN model_outcomes o USING (forecast_id)
+        WHERE f.forecasted_at > now() - (? * INTERVAL '1 hour')
+          AND f.p_count_ebikes_json IS NOT NULL
+        """,
+        [window_hours],
+    ).df()
+    if df.empty:
+        return {"window_hours": window_hours, "k_values": list(k_values), "by_k": {}}
+
+    parsed = []
+    for record in df.to_dict(orient="records"):
+        try:
+            pmf = json.loads(record["p_count_ebikes_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        # Bins are "0".."4" and "5_plus". Sum >= k.
+        bins: dict[int, float] = {}
+        plus_bin = 0.0
+        for key, val in pmf.items():
+            if key == "5_plus":
+                plus_bin = float(val)
+                continue
+            try:
+                bins[int(key)] = float(val)
+            except (TypeError, ValueError):
+                continue
+        for k in k_values:
+            if k <= 4:
+                p_ge_k = sum(p for j, p in bins.items() if j >= k) + plus_bin
+            else:
+                # k=5: only the 5_plus bin contributes.
+                p_ge_k = plus_bin if k == 5 else 0.0
+            parsed.append({
+                "model_key": record["model_key"],
+                "model_label": record["model_label"],
+                "k": k,
+                "p_ge_k": float(min(max(p_ge_k, 0.0), 1.0)),
+                "y_ge_k": int(int(record["observed_ebikes"] or 0) >= k),
+            })
+    if not parsed:
+        return {"window_hours": window_hours, "k_values": list(k_values), "by_k": {}}
+
+    parsed_df = pd.DataFrame(parsed)
+    by_k: dict[int, dict] = {}
+    for k in k_values:
+        slice_df = parsed_df[parsed_df["k"] == k]
+        if slice_df.empty:
+            by_k[int(k)] = {"k": int(k), "n_total": 0, "model_leaderboard": []}
+            continue
+        rows = []
+        for model_key, group in slice_df.groupby("model_key"):
+            n = int(len(group))
+            y = group["y_ge_k"].astype(float)
+            p = group["p_ge_k"].astype(float).clip(0.001, 0.999)
+            rows.append({
+                "model_key": model_key,
+                "model_label": (
+                    group["model_label"].dropna().iloc[0]
+                    if group["model_label"].notna().any()
+                    else model_key
+                ),
+                "n": n,
+                "brier_score": float(((y - p) ** 2).mean()),
+                "log_loss": float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean()),
+                "observed_rate": float(y.mean()),
+                "mean_prediction": float(p.mean()),
+            })
+        rows.sort(key=lambda r: r["brier_score"])
+        for rank, row in enumerate(rows, start=1):
+            row["rank"] = rank
+        by_k[int(k)] = {
+            "k": int(k),
+            "n_total": int(len(slice_df)),
+            "model_leaderboard": rows,
+        }
+    return {"window_hours": window_hours, "k_values": list(k_values), "by_k": by_k}
+
+
+def open_dock_performance_summary(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window_hours: int = 24,
+    initialize_schema: bool = True,
+) -> dict:
+    """Per-model leaderboard for the *parking-side* prediction.
+
+    Uses (1 - p_capacity_violation) as the model's predicted P(open dock at t)
+    and (observed_docks > 0) as ground truth. Only models that emit
+    p_capacity_violation contribute (currently the SOTA + inventory-world
+    family).
+
+    This is the dual of the binary "has eBike" benchmark and exposes a half
+    of the user journey (returning a bike) that the existing tabs miss.
+    The (1 - p_capacity_violation) framing is a proxy for the eventual
+    first-class p_has_open_dock target flagged in the cdg_nmip TODO.
+    """
+    if initialize_schema:
+        init_schema(conn)
+    df = conn.execute(
+        """
+        SELECT
+          f.model_key,
+          COALESCE(f.model_label, f.model_version) AS model_label,
+          f.p_capacity_violation,
+          o.observed_docks
+        FROM model_forecasts f JOIN model_outcomes o USING (forecast_id)
+        WHERE f.forecasted_at > now() - (? * INTERVAL '1 hour')
+          AND f.p_capacity_violation IS NOT NULL
+          AND o.observed_docks IS NOT NULL
+        """,
+        [window_hours],
+    ).df()
+    if df.empty:
+        return {"window_hours": window_hours, "n_total": 0, "open_rate": None, "model_leaderboard": []}
+    df["p_open"] = (1.0 - df["p_capacity_violation"].astype(float)).clip(0.001, 0.999)
+    df["y_open"] = (df["observed_docks"].fillna(0).astype(int) > 0).astype(int)
+    open_rate = float(df["y_open"].mean())
+
+    rows = []
+    for model_key, group in df.groupby("model_key"):
+        n = int(len(group))
+        y = group["y_open"].astype(float)
+        p = group["p_open"].astype(float)
+        rows.append({
+            "model_key": model_key,
+            "model_label": (
+                group["model_label"].dropna().iloc[0]
+                if group["model_label"].notna().any()
+                else model_key
+            ),
+            "n": n,
+            "brier_score": float(((y - p) ** 2).mean()),
+            "log_loss": float(-(y * np.log(p) + (1 - y) * np.log(1 - p)).mean()),
+            "observed_rate": float(y.mean()),
+            "mean_prediction": float(p.mean()),
+        })
+    rows.sort(key=lambda r: r["brier_score"])
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    return {
+        "window_hours": window_hours,
+        "n_total": int(len(df)),
+        "open_rate": open_rate,
+        "model_leaderboard": rows,
+    }
+
+
+def topk_recommendation_summary(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window_hours: int = 24,
+    k_values: tuple[int, ...] = (1, 3, 5),
+    initialize_schema: bool = True,
+) -> dict:
+    """For each multi-bike-plan request, did the model's top-k recommended
+    stations include the actually-best station (most observed_ebikes)?
+
+    The "best" station per request is determined among the candidates that
+    have a resolved outcome. A model gets credit for top-k if any of its
+    top-k recommended_rank stations is the argmax-observed station.
+
+    Limited to source LIKE 'api%' (real recommendation requests) so we don't
+    score self_eval forecasts where there's no decision being made.
+    """
+    if initialize_schema:
+        init_schema(conn)
+    df = conn.execute(
+        """
+        SELECT
+          f.request_id,
+          f.model_key,
+          COALESCE(f.model_label, f.model_version) AS model_label,
+          f.station_id,
+          f.recommended_rank,
+          o.observed_ebikes,
+          o.observed_has_ebike,
+          f.horizon_minutes
+        FROM model_forecasts f JOIN model_outcomes o USING (forecast_id)
+        WHERE f.forecasted_at > now() - (? * INTERVAL '1 hour')
+          AND f.source LIKE 'api%'
+          AND f.request_id IS NOT NULL
+          AND f.horizon_minutes = 10
+        """,
+        [window_hours],
+    ).df()
+    if df.empty:
+        return {"window_hours": window_hours, "k_values": list(k_values), "model_leaderboard": []}
+
+    # For each request, find the actually-best station(s) (max observed_ebikes).
+    best_per_request: dict[str, set[str]] = {}
+    for request_id, group in df.groupby("request_id"):
+        observed = group.drop_duplicates(subset=["station_id"])[["station_id", "observed_ebikes"]]
+        if observed.empty:
+            continue
+        max_obs = observed["observed_ebikes"].max()
+        if pd.isna(max_obs):
+            continue
+        best_per_request[request_id] = set(
+            str(s) for s in observed.loc[observed["observed_ebikes"] == max_obs, "station_id"]
+        )
+    if not best_per_request:
+        return {"window_hours": window_hours, "k_values": list(k_values), "model_leaderboard": []}
+
+    rows = []
+    for model_key, group in df.groupby("model_key"):
+        per_k_hits = {k: 0 for k in k_values}
+        n_requests = 0
+        label = (
+            group["model_label"].dropna().iloc[0]
+            if group["model_label"].notna().any()
+            else model_key
+        )
+        for request_id, request_group in group.groupby("request_id"):
+            best = best_per_request.get(request_id)
+            if not best:
+                continue
+            ranked = request_group.dropna(subset=["recommended_rank"]).sort_values("recommended_rank")
+            if ranked.empty:
+                continue
+            n_requests += 1
+            for k in k_values:
+                topk_stations = set(str(s) for s in ranked.head(k)["station_id"])
+                if topk_stations & best:
+                    per_k_hits[k] += 1
+        if n_requests == 0:
+            continue
+        row = {
+            "model_key": model_key,
+            "model_label": label,
+            "n_requests": n_requests,
+        }
+        for k in k_values:
+            row[f"top{k}_hit_rate"] = per_k_hits[k] / n_requests
+        rows.append(row)
+    rows.sort(
+        key=lambda r: -r.get(f"top{k_values[0]}_hit_rate", 0.0)
+    )
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    return {
+        "window_hours": window_hours,
+        "k_values": list(k_values),
+        "model_leaderboard": rows,
+    }
+
+
+def survival_calibration_summary(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    window_hours: int = 24,
+    initialize_schema: bool = True,
+) -> dict:
+    """Empty-station survival-curve calibration per (horizon, model).
+
+    For forecasts where current_ebikes == 0, treat (1 - p_has_ebike) as the
+    survival probability "still empty at horizon t". Aggregate per
+    (horizon, model) so the dashboard can plot predicted-vs-observed
+    survival curves and read off where each model's arrival modeling
+    diverges from reality.
+    """
+    if initialize_schema:
+        init_schema(conn)
+    df = conn.execute(
+        """
+        SELECT
+          f.model_key,
+          COALESCE(f.model_label, f.model_version) AS model_label,
+          f.horizon_minutes,
+          f.p_has_ebike,
+          o.observed_has_ebike
+        FROM model_forecasts f JOIN model_outcomes o USING (forecast_id)
+        WHERE f.forecasted_at > now() - (? * INTERVAL '1 hour')
+          AND f.current_ebikes = 0
+        """,
+        [window_hours],
+    ).df()
+    if df.empty:
+        return {"window_hours": window_hours, "by_horizon_model": [], "horizons": []}
+
+    df["observed_still_empty"] = (~df["observed_has_ebike"].astype(bool)).astype(float)
+    df["predicted_still_empty"] = (1.0 - df["p_has_ebike"].astype(float)).clip(0.001, 0.999)
+    df["brier"] = (df["observed_still_empty"] - df["predicted_still_empty"]) ** 2
+
+    rows = []
+    horizons = sorted({int(h) for h in df["horizon_minutes"].dropna().unique()})
+    for (model_key, horizon), group in df.groupby(["model_key", "horizon_minutes"]):
+        n = int(len(group))
+        rows.append({
+            "model_key": model_key,
+            "model_label": (
+                group["model_label"].dropna().iloc[0]
+                if group["model_label"].notna().any()
+                else model_key
+            ),
+            "horizon_minutes": int(horizon),
+            "n": n,
+            "predicted_still_empty": float(group["predicted_still_empty"].mean()),
+            "observed_still_empty": float(group["observed_still_empty"].mean()),
+            "brier": float(group["brier"].mean()),
+        })
+    rows.sort(key=lambda r: (r["model_key"], r["horizon_minutes"]))
+    return {
+        "window_hours": window_hours,
+        "horizons": horizons,
+        "by_horizon_model": rows,
+    }
+
+
 def per_horizon_performance_summary(
     conn: duckdb.DuckDBPyConnection,
     *,
