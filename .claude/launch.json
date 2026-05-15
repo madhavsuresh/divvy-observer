@@ -28,6 +28,15 @@
         "--browser.gatherUsageStats=false"
       ],
       "port": 8505
+    },
+    {
+      "name": "divvy-dashboard-shared",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "DIVVY_DATA_DIR=/Volumes/GameDrive/fun/divvy-observer/data uv run streamlit run src/divvy/dashboard.py --server.headless=true --server.port=8511 --browser.gatherUsageStats=false"
+      ],
+      "port": 8511
     }
   ]
 }
