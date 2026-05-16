@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+import pandas as pd
+
 import requests
 
 from . import config, db, forecast_queue, model_eval, service_state, tile
@@ -47,8 +49,18 @@ class PollerState:
     rows_inserted_total: int = 0
 
 
-def process_prediction_writes(conn, state: PollerState, now: float) -> dict:
-    """Drain prediction-service writes while the collector owns DuckDB."""
+def process_prediction_writes(
+    conn,
+    state: PollerState,
+    now: float,
+    pre_scored_self_eval: pd.DataFrame | None = None,
+) -> dict:
+    """Drain prediction-service writes while the collector owns DuckDB.
+
+    Pass ``pre_scored_self_eval`` (result of
+    :func:`model_eval.score_self_evaluation_candidates` called before the
+    write lock was acquired) to skip ML inference inside the lock.
+    """
     summary = {
         "forecast_queue_files_processed": 0,
         "forecast_rows_logged": 0,
@@ -89,11 +101,14 @@ def process_prediction_writes(conn, state: PollerState, now: float) -> dict:
         now - state.last_self_eval_unix
     ) >= config.SELF_EVAL_INTERVAL_SECONDS:
         try:
-            emitted = model_eval.emit_self_evaluation_forecasts(
-                conn,
-                station_sample_size=config.SELF_EVAL_STATION_SAMPLE,
-                tick_index=state.self_eval_tick_index,
-            )
+            if pre_scored_self_eval is not None:
+                emitted = model_eval.log_self_evaluation_scored(conn, pre_scored_self_eval)
+            else:
+                emitted = model_eval.emit_self_evaluation_forecasts(
+                    conn,
+                    station_sample_size=config.SELF_EVAL_STATION_SAMPLE,
+                    tick_index=state.self_eval_tick_index,
+                )
             summary["self_eval_forecasts_logged"] = int(emitted)
             state.last_self_eval_unix = now
             state.self_eval_tick_index += 1
@@ -318,6 +333,22 @@ def poll_once(state: PollerState) -> None:
     status_payload = _fetch(config.STATION_STATUS_URL)
     free_payload = _fetch(config.FREE_BIKE_STATUS_URL)
 
+    # Score self-eval candidates before acquiring the write lock so ML inference
+    # doesn't contribute to write-lock hold time (which starves automation jobs).
+    pre_scored_self_eval: pd.DataFrame | None = None
+    if config.SELF_EVAL_INTERVAL_SECONDS > 0 and (
+        now - state.last_self_eval_unix
+    ) >= config.SELF_EVAL_INTERVAL_SECONDS:
+        try:
+            with db.session(read_only=True) as ro_conn:
+                pre_scored_self_eval = model_eval.score_self_evaluation_candidates(
+                    ro_conn,
+                    station_sample_size=config.SELF_EVAL_STATION_SAMPLE,
+                    tick_index=state.self_eval_tick_index,
+                )
+        except Exception as exc:
+            log.exception("self-eval pre-scoring failed: %s", exc)
+
     with db.session(read_only=False) as conn:
         db.init_schema(conn)
         if info_payload is not None:
@@ -326,7 +357,7 @@ def poll_once(state: PollerState) -> None:
             log.info("refreshed station_information: %d stations", n_stations)
         inserted = insert_status(conn, status_payload)
         free_inserted = insert_free_bikes(conn, free_payload)
-        prediction_summary = process_prediction_writes(conn, state, now)
+        prediction_summary = process_prediction_writes(conn, state, now, pre_scored_self_eval)
         service_state.heartbeat(
             conn,
             "divvy.collector",

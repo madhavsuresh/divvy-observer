@@ -232,7 +232,7 @@ def refresh_live_station_predictions_coexisting(
         as_of = _utc_now()
         active_key = suite.active_key
         rows = _prediction_rows_from_scored(scored, suite, selected_model_keys, horizons, as_of)
-    with db.session(read_only=False, retries=60, retry_sleep=1.0) as write_conn:
+    with db.session(read_only=False, retries=180, retry_sleep=1.0) as write_conn:
         db.init_schema(write_conn)
         _write_prediction_rows(write_conn, rows)
         try:

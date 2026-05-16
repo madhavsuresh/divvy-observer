@@ -538,31 +538,26 @@ def resolve_due_outcomes(
     return len(rows)
 
 
-def emit_self_evaluation_forecasts(
+def score_self_evaluation_candidates(
     conn: duckdb.DuckDBPyConnection,
     *,
     station_sample_size: int,
     tick_index: int,
     horizons: tuple[int, ...] = HORIZONS,
-) -> int:
-    """Score a rotating shard of stations and log the forecasts.
+) -> pd.DataFrame | None:
+    """Fetch candidates and run ML scoring; safe to call with a read-only connection.
 
-    Keeps the prediction → outcome → metric → selection loop fed when no
-    API traffic is arriving. Tagged ``source='self_eval'`` with NULL
-    ``request_id`` so the existing guard at the top of the
-    ``recommendation_outcomes`` insert in :func:`resolve_due_outcomes`
-    leaves them out of distance-adjusted-regret accounting; they still
-    flow into ``model_outcomes`` and ``model_metrics`` unchanged.
+    Returns the scored DataFrame, or None if there is nothing to score.
+    Persist results with :func:`log_self_evaluation_scored` inside the write lock.
     """
-    init_schema(conn)
     if station_sample_size <= 0:
-        return 0
+        return None
     total_row = conn.execute(
         "SELECT COUNT(*) FROM stations WHERE lat IS NOT NULL AND lon IS NOT NULL"
     ).fetchone()
     total = int(total_row[0] if total_row else 0)
     if total <= 0:
-        return 0
+        return None
     offset = (int(tick_index) * int(station_sample_size)) % max(total, 1)
     candidates = conn.execute(
         """
@@ -600,10 +595,17 @@ def emit_self_evaluation_forecasts(
         [int(station_sample_size), offset],
     ).df()
     if candidates.empty:
-        return 0
+        return None
     scored, _suite = predictor.score_candidates(conn, candidates, horizons=horizons)
-    if scored.empty:
-        return 0
+    return scored if not scored.empty else None
+
+
+def log_self_evaluation_scored(
+    conn: duckdb.DuckDBPyConnection,
+    scored: pd.DataFrame,
+    horizons: tuple[int, ...] = HORIZONS,
+) -> int:
+    """Persist pre-scored self-eval forecasts. Must be called with a write connection."""
     return log_forecasts(
         conn,
         scored,
@@ -617,6 +619,39 @@ def emit_self_evaluation_forecasts(
         query_label="self_eval",
         horizons=horizons,
     )
+
+
+def emit_self_evaluation_forecasts(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    station_sample_size: int,
+    tick_index: int,
+    horizons: tuple[int, ...] = HORIZONS,
+) -> int:
+    """Score a rotating shard of stations and log the forecasts.
+
+    Keeps the prediction → outcome → metric → selection loop fed when no
+    API traffic is arriving. Tagged ``source='self_eval'`` with NULL
+    ``request_id`` so the existing guard at the top of the
+    ``recommendation_outcomes`` insert in :func:`resolve_due_outcomes`
+    leaves them out of distance-adjusted-regret accounting; they still
+    flow into ``model_outcomes`` and ``model_metrics`` unchanged.
+
+    When called from the collector tick, prefer pre-scoring via
+    :func:`score_self_evaluation_candidates` before acquiring the write lock,
+    then logging with :func:`log_self_evaluation_scored`, to avoid holding
+    the write lock during the expensive ML inference step.
+    """
+    init_schema(conn)
+    scored = score_self_evaluation_candidates(
+        conn,
+        station_sample_size=station_sample_size,
+        tick_index=tick_index,
+        horizons=horizons,
+    )
+    if scored is None:
+        return 0
+    return log_self_evaluation_scored(conn, scored, horizons=horizons)
 
 
 def _joined_forecasts(conn: duckdb.DuckDBPyConnection, window_hours: int) -> pd.DataFrame:
