@@ -413,20 +413,96 @@ def _resolve_location(default_lat: float, default_lon: float) -> tuple[float, fl
     return float(lat), float(lon), f"({lat:.4f}, {lon:.4f})"
 
 
-def _station_thumbnail(station: dict, *, horizon_label: str = "10m") -> None:
-    """Compact rider-facing card for one station: dot grid + name + distance."""
-    p = station.get(f"p_has_ebike_{horizon_label}") or station.get("p_arrival")
+def _station_dock_probability(station: dict, *, horizon_label: str = "10m") -> float | None:
+    """Pull P(has open dock at horizon) from the API station payload.
+
+    Tries the dock-constrained arrival probability first (primary signal),
+    then falls back to the capacity-violation probability. Both are stored
+    as "no dock" probabilities, so the rider quantity is `1 − value`.
+    """
+    raw = station.get(f"p_dock_constrained_arrival_{horizon_label}")
+    if raw is None:
+        raw = station.get(f"p_capacity_violation_{horizon_label}")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, min(1.0, 1.0 - float(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _station_thumbnail(
+    station: dict,
+    *,
+    horizon_label: str = "10m",
+    show_bike: bool = True,
+    show_dock: bool = False,
+) -> None:
+    """Compact rider-facing card for one station: dot grid(s) + name + distance.
+
+    Shows the P(has bike) dot grid by default. When ``show_dock`` is on,
+    a second grid colored orange shows P(has open dock) for the return
+    trip — useful when the rider is bringing a bike back and needs an
+    open dock at the destination.
+    """
+    p_bike = station.get(f"p_has_ebike_{horizon_label}") or station.get("p_arrival")
+    p_dock = _station_dock_probability(station, horizon_label=horizon_label) if show_dock else None
     name = station.get("name") or "Unknown station"
     distance = station.get("distance_km")
     arrival = station.get("arrival_time_minutes")
     current = station.get("current_ebikes") or 0
+    current_docks = station.get("current_docks")
 
-    positions = dashboard_metrics.dot_grid_positions(p, n=100, cols=10)
-    chart = viz.dot_grid_chart(positions, probability=p, title=name, dot_size=90)
-    st.altair_chart(chart, use_container_width=False)
-    st.caption(
-        f"📍 {_km_label(distance)} · 🚶 {_minutes_label(arrival)} · 🚲 {int(current)} now"
-    )
+    if show_bike and show_dock:
+        cols = st.columns(2)
+        with cols[0]:
+            positions = dashboard_metrics.dot_grid_positions(p_bike, n=100, cols=10)
+            st.altair_chart(
+                viz.dot_grid_chart(
+                    positions, probability=p_bike, title=f"🚲 {name}",
+                    filled_color=viz.BIKE_COLOR, dot_size=70,
+                ),
+                use_container_width=False,
+            )
+        with cols[1]:
+            positions = dashboard_metrics.dot_grid_positions(p_dock, n=100, cols=10)
+            st.altair_chart(
+                viz.dot_grid_chart(
+                    positions, probability=p_dock, title=f"🅿️ open dock",
+                    filled_color=viz.DOCK_COLOR, dot_size=70,
+                ),
+                use_container_width=False,
+            )
+    elif show_dock:
+        positions = dashboard_metrics.dot_grid_positions(p_dock, n=100, cols=10)
+        st.altair_chart(
+            viz.dot_grid_chart(
+                positions, probability=p_dock, title=name,
+                filled_color=viz.DOCK_COLOR, dot_size=90,
+            ),
+            use_container_width=False,
+        )
+    else:
+        positions = dashboard_metrics.dot_grid_positions(p_bike, n=100, cols=10)
+        st.altair_chart(
+            viz.dot_grid_chart(
+                positions, probability=p_bike, title=name,
+                filled_color=viz.BIKE_COLOR, dot_size=90,
+            ),
+            use_container_width=False,
+        )
+
+    caption_parts = [
+        f"📍 {_km_label(distance)}",
+        f"🚶 {_minutes_label(arrival)}",
+        f"🚲 {int(current)} now",
+    ]
+    if show_dock and current_docks is not None:
+        try:
+            caption_parts.append(f"🅿️ {int(current_docks)} docks")
+        except (TypeError, ValueError):
+            pass
+    st.caption(" · ".join(caption_parts))
 
 
 def _render_find_a_bike() -> None:
@@ -434,7 +510,8 @@ def _render_find_a_bike() -> None:
     st.caption(
         "Each dot = 1 in 100 trips. Fill count shows your chance of finding a bike "
         "when you arrive. Choose the station with the densest dots that's also a "
-        "comfortable walk."
+        "comfortable walk. Toggle 🅿️ to also see open-dock probabilities — "
+        "useful when you're bringing a bike *back*."
     )
 
     lat, lon, location_label = _resolve_location(CHICAGO_LAT, CHICAGO_LON)
@@ -447,6 +524,16 @@ def _render_find_a_bike() -> None:
         search_radius_km = st.slider(
             "Search radius (km)", 0.5, 3.0, 1.5, 0.1, key="find_search_radius"
         )
+
+    mode = st.sidebar.radio(
+        "I'm looking for…",
+        options=["🚲 a bike", "🅿️ an open dock", "Both"],
+        index=0,
+        key="find_mode",
+        help="Pickup, return, or both probabilities side-by-side.",
+    )
+    show_bike = mode in ("🚲 a bike", "Both")
+    show_dock = mode in ("🅿️ an open dock", "Both")
 
     try:
         payload = _prediction_recommendation(
@@ -465,21 +552,29 @@ def _render_find_a_bike() -> None:
 
     # ----- Hero card -----
     st.markdown("### Recommended right now")
-    hero_cols = st.columns([1, 1.2])
+    hero_cols = st.columns([1.4, 1])
     with hero_cols[0]:
-        _station_thumbnail(best, horizon_label="10m")
+        _station_thumbnail(best, horizon_label="10m", show_bike=show_bike, show_dock=show_dock)
     with hero_cols[1]:
         st.markdown(f"#### {best.get('name', '—')}")
-        st.markdown(
+        lines = [
             f"**Walk:** {_km_label(best.get('distance_km'))} "
-            f"(~{_minutes_label(best.get('arrival_time_minutes'))})  \n"
-            f"**Bikes right now:** {int(best.get('current_ebikes') or 0)}  \n"
-            f"**P(bike when you arrive):** {_prob_label(best.get('p_arrival'))}"
-        )
+            f"(~{_minutes_label(best.get('arrival_time_minutes'))})",
+            f"**Bikes right now:** {int(best.get('current_ebikes') or 0)}",
+        ]
+        if show_bike:
+            lines.append(f"**P(bike when you arrive):** {_prob_label(best.get('p_arrival'))}")
+        if show_dock:
+            p_dock = _station_dock_probability(best, horizon_label="10m")
+            current_docks = best.get("current_docks")
+            if current_docks is not None:
+                lines.append(f"**Docks right now:** {int(current_docks)}")
+            lines.append(f"**P(open dock when you arrive):** {_prob_label(p_dock)}")
+        st.markdown("  \n".join(lines))
         lcb = best.get("reliable_probability_lcb")
-        if lcb is not None:
+        if lcb is not None and show_bike:
             st.caption(
-                f"Conservative estimate (95% LCB after calibration): "
+                f"Conservative bike estimate (95% LCB after calibration): "
                 f"{_prob_label(lcb)}. Use this as your worst-case planning bet."
             )
         st.caption(f"Active model: `{payload.get('active_model_key') or '—'}`")
@@ -491,7 +586,10 @@ def _render_find_a_bike() -> None:
         cols = st.columns(len(cohort))
         for col, station in zip(cols, cohort):
             with col:
-                _station_thumbnail(station, horizon_label="10m")
+                _station_thumbnail(
+                    station, horizon_label="10m",
+                    show_bike=show_bike, show_dock=show_dock,
+                )
 
     # ----- Map -----
     st.markdown("### Map")
@@ -601,14 +699,17 @@ def _render_find_a_bike() -> None:
 # =============================================================================
 
 
+def _target_from_payload(payload: dict, station_id: str) -> dict | None:
+    for candidate in [payload.get("best_practical_station_5_10m"), *(payload.get("reliable_alternatives") or [])]:
+        if candidate and candidate.get("station_id") == station_id:
+            return candidate
+    return None
+
+
 def _build_station_horizon_curve(payload: dict, station_id: str) -> pd.DataFrame:
     """Extract per-horizon P(has bike) for the active model + comparison models."""
     rows = []
-    target_station = None
-    for candidate in [payload.get("best_practical_station_5_10m"), *(payload.get("reliable_alternatives") or [])]:
-        if candidate and candidate.get("station_id") == station_id:
-            target_station = candidate
-            break
+    target_station = _target_from_payload(payload, station_id)
     if target_station is None:
         return pd.DataFrame()
     for horizon in predictor.HORIZONS:
@@ -630,6 +731,37 @@ def _build_station_horizon_curve(payload: dict, station_id: str) -> pd.DataFrame
                 "horizon_minutes": horizon,
                 "p_has_ebike": float(p),
                 "model_label": model.get("label") or model.get("model_key") or "model",
+            })
+    return pd.DataFrame(rows)
+
+
+def _build_station_dock_curve(payload: dict, station_id: str) -> pd.DataFrame:
+    """Extract per-horizon P(has open dock) for the active model.
+
+    Pulled from the per-model predictions list — the top-level payload only
+    carries the 10m dock probability. Falls back to ``p_capacity_violation``
+    when ``p_dock_constrained_arrival`` is missing.
+    """
+    target_station = _target_from_payload(payload, station_id)
+    if target_station is None:
+        return pd.DataFrame()
+    rows = []
+    for model in (target_station.get("model_predictions") or []):
+        label = model.get("label") or model.get("model_key") or "model"
+        for horizon in predictor.HORIZONS:
+            raw = model.get(f"p_dock_constrained_arrival_{horizon}m")
+            if raw is None:
+                raw = model.get(f"p_capacity_violation_{horizon}m")
+            if raw is None:
+                continue
+            try:
+                p_open = max(0.0, min(1.0, 1.0 - float(raw)))
+            except (TypeError, ValueError):
+                continue
+            rows.append({
+                "horizon_minutes": horizon,
+                "p_has_open_dock": p_open,
+                "model_label": label,
             })
     return pd.DataFrame(rows)
 
@@ -680,7 +812,7 @@ def _render_station_detail() -> None:
                    last_obs.strftime("%H:%M") if isinstance(last_obs, datetime) else "—")
 
     # ----- Per-horizon forecast curve -----
-    st.markdown("#### Forecast — P(has bike) by horizon")
+    st.markdown("#### Forecast — probabilities by horizon")
     try:
         recommendation = _prediction_recommendation(
             float(meta.get("lat") or CHICAGO_LAT),
@@ -688,23 +820,82 @@ def _render_station_detail() -> None:
             0.5, 1.5, query_label=f"station:{sid}",
         )
         horizon_df = _build_station_horizon_curve(recommendation, sid)
+        dock_df = _build_station_dock_curve(recommendation, sid)
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Couldn't fetch live forecast: {exc}")
         horizon_df = pd.DataFrame()
+        dock_df = pd.DataFrame()
 
-    if horizon_df.empty:
+    if horizon_df.empty and dock_df.empty:
         st.info("No live forecast available — the predictor returned no rows for this station.")
     else:
-        compare = st.toggle(
+        toggle_cols = st.columns([1, 1, 1])
+        show_bike_curve = toggle_cols[0].toggle(
+            "🚲 Show P(has bike)", value=True, key="station_detail_show_bike"
+        )
+        show_dock_curve = toggle_cols[1].toggle(
+            "🅿️ Show P(has open dock)", value=True, key="station_detail_show_dock"
+        )
+        compare = toggle_cols[2].toggle(
             "Compare all models", value=False, key="station_detail_compare",
-            help="Show every model's forecast curve instead of just the active model.",
+            help="Show every model's curve instead of just the active model.",
         )
-        if not compare:
-            horizon_df = horizon_df[horizon_df["model_label"] == "active"]
-        st.altair_chart(
-            viz.horizon_curve_chart(horizon_df, title="P(has bike) over horizon"),
-            use_container_width=True,
-        )
+
+        if not horizon_df.empty and show_bike_curve:
+            bike_df = horizon_df.copy()
+            if not compare:
+                bike_df = bike_df[bike_df["model_label"] == "active"]
+            bike_df["target"] = "P(has bike)"
+            bike_df = bike_df.rename(columns={"p_has_ebike": "probability"})
+        else:
+            bike_df = pd.DataFrame()
+
+        if not dock_df.empty and show_dock_curve:
+            # No 'active' aggregation for dock (only per-model), so just dedupe per-horizon mean.
+            if not compare and not dock_df.empty:
+                # Average across models for a single curve when not in compare mode.
+                summary = (
+                    dock_df.groupby("horizon_minutes")["p_has_open_dock"].mean().reset_index()
+                )
+                summary["model_label"] = "active"
+                dock_summary = summary
+            else:
+                dock_summary = dock_df.rename(columns={"p_has_open_dock": "probability"}).copy()
+                dock_summary["target"] = "P(has open dock)"
+            if "probability" not in dock_summary.columns:
+                dock_summary = dock_summary.rename(columns={"p_has_open_dock": "probability"})
+            dock_summary["target"] = "P(has open dock)"
+        else:
+            dock_summary = pd.DataFrame()
+
+        combined = pd.concat([bike_df, dock_summary], ignore_index=True) if not (bike_df.empty and dock_summary.empty) else pd.DataFrame()
+        if combined.empty:
+            st.info("Both target toggles are off — turn one on to see the curve.")
+        else:
+            combined = combined.dropna(subset=["probability"])
+            color_scale = alt.Scale(
+                domain=["P(has bike)", "P(has open dock)"],
+                range=[viz.BIKE_COLOR, viz.DOCK_COLOR],
+            )
+            stroke_scale = alt.Scale(scheme=viz.MODEL_PALETTE)
+            line_encoding = {
+                "x": alt.X("horizon_minutes:Q", title="Minutes from now"),
+                "y": alt.Y("probability:Q", title="Probability", scale=alt.Scale(domain=[0, 1])),
+                "color": alt.Color("target:N", scale=color_scale, legend=alt.Legend(title="Target")),
+                "tooltip": [
+                    alt.Tooltip("target:N", title="Target"),
+                    alt.Tooltip("model_label:N", title="Model"),
+                    alt.Tooltip("horizon_minutes:Q", title="Horizon"),
+                    alt.Tooltip("probability:Q", format=".2f", title="P"),
+                ],
+            }
+            if compare and combined["model_label"].nunique() > 1:
+                line_encoding["strokeDash"] = alt.StrokeDash("model_label:N", legend=alt.Legend(title="Model"))
+            chart = alt.Chart(combined).mark_line(point=True, strokeWidth=2).encode(**line_encoding)
+            st.altair_chart(
+                chart.properties(title="Bike + dock probability over horizon", height=240, width="container"),
+                use_container_width=True,
+            )
 
     # ----- Historical availability heatmap -----
     st.markdown("#### Historical P(has bike) by hour × day-of-week")
@@ -886,6 +1077,20 @@ def _render_performance(window_hours: int) -> None:
 # =============================================================================
 
 
+_TARGET_SPECS = {
+    "P(has bike)": {
+        "prob_col": "p_has_ebike",
+        "outcome_col": "observed_has_ebike",
+        "label": "P(has bike)",
+    },
+    "P(has open dock)": {
+        "prob_col": "p_has_open_dock",
+        "outcome_col": "observed_has_open_dock",
+        "label": "P(has open dock)",
+    },
+}
+
+
 def _render_calibration(window_hours: int) -> None:
     st.subheader(f"📐 Calibration ({window_hours}h window)")
     resolved = _resolved_forecasts(window_hours)
@@ -893,39 +1098,62 @@ def _render_calibration(window_hours: int) -> None:
         st.info("No resolved outcomes yet.")
         return
 
-    # ----- Model + horizon filters -----
+    # Always attach the dock-target columns so the selector works.
+    resolved = dashboard_metrics.derive_dock_target(resolved)
+
+    # ----- Target + model + horizon filters -----
+    filt_cols = st.columns([1.4, 2, 2, 1])
+    target_label = filt_cols[0].radio(
+        "Target",
+        options=list(_TARGET_SPECS.keys()),
+        index=0,
+        key="calib_target",
+        help="Choose which probability to calibrate against. Bike = pickup, dock = return trip.",
+    )
+    target = _TARGET_SPECS[target_label]
+    prob_col = target["prob_col"]
+    outcome_col = target["outcome_col"]
+    if prob_col not in resolved.columns or resolved[prob_col].dropna().empty:
+        st.info(f"No samples for {target_label} yet — this signal may not be populated for any active model.")
+        return
+
     models = sorted({m for m in resolved["model_key"].dropna().unique()})
     horizons = sorted({int(h) for h in resolved["horizon_minutes"].dropna().unique()})
-    filt_cols = st.columns([2, 2, 1])
-    selected_models = filt_cols[0].multiselect(
+    selected_models = filt_cols[1].multiselect(
         "Models",
         options=models,
         default=models[:5] if len(models) > 5 else models,
         key="calib_models",
     )
-    selected_horizons = filt_cols[1].multiselect(
+    selected_horizons = filt_cols[2].multiselect(
         "Horizons (min)",
         options=horizons,
         default=[h for h in (10, 30) if h in horizons] or horizons[:2],
         key="calib_horizons",
     )
-    facet_by_horizon = filt_cols[2].checkbox("Facet by horizon", value=False, key="calib_facet")
+    facet_by_horizon = filt_cols[3].checkbox("Facet by horizon", value=False, key="calib_facet")
 
     filtered = resolved[
         resolved["model_key"].isin(selected_models)
         & resolved["horizon_minutes"].isin(selected_horizons)
     ].copy()
+    filtered = filtered.dropna(subset=[prob_col, outcome_col])
     if filtered.empty:
-        st.info("Filter selected zero rows. Pick at least one model and horizon.")
+        st.info("Filter selected zero rows for this target. Pick at least one model and horizon.")
         return
+
+    target_caption = f"Target: **{target_label}** · {len(filtered):,} resolved samples in scope"
+    st.caption(target_caption)
 
     # ----- Reliability diagram -----
     st.markdown("#### Reliability diagram")
     st.caption(
-        "Predicted P(has bike) on x, observed positive rate on y, with Wilson 95% intervals. "
+        f"Predicted {target_label} on x, observed positive rate on y, with Wilson 95% intervals. "
         "Dots on the diagonal = calibrated. Below the diagonal = overconfident; above = underconfident."
     )
-    rel = dashboard_metrics.reliability_curve(filtered)
+    rel = dashboard_metrics.reliability_curve(
+        filtered, prob_col=prob_col, outcome_col=outcome_col,
+    )
     if rel.empty:
         st.info("No bins have ≥5 samples — try a longer window.")
     else:
@@ -939,11 +1167,13 @@ def _render_calibration(window_hours: int) -> None:
     # ----- Score distribution (discrimination) -----
     st.markdown("#### Discrimination — predicted probability split by outcome")
     st.caption(
-        "Two overlaid histograms: predicted P(has bike) when the station actually had a bike (blue) "
-        "vs. when it didn't (red). Well-separated = the model is discriminating; overlapping = the model "
-        "can't tell good stations from bad."
+        f"Two overlaid histograms: predicted {target_label} when the outcome was positive (blue) vs. "
+        "negative (red). Well-separated = the model is discriminating; overlapping = the model can't "
+        "tell good cases from bad."
     )
-    dist = dashboard_metrics.score_distribution(filtered)
+    dist = dashboard_metrics.score_distribution(
+        filtered, prob_col=prob_col, outcome_col=outcome_col,
+    )
     if dist.empty:
         st.info("Not enough samples.")
     else:
@@ -967,6 +1197,8 @@ def _render_calibration(window_hours: int) -> None:
     )
     sharp = dashboard_metrics.sharpness_ece_scatter(
         bucketed,
+        prob_col=prob_col,
+        outcome_col=outcome_col,
         bucket_cols=("hour_band",),
         min_per_bucket=30,
     )
@@ -982,7 +1214,9 @@ def _render_calibration(window_hours: int) -> None:
         "Solid red = systematically overconfident; solid blue = systematically underconfident; "
         "white = well-calibrated."
     )
-    heatmap_df = dashboard_metrics.coverage_heatmap_data(filtered, min_per_cell=15)
+    heatmap_df = dashboard_metrics.coverage_heatmap_data(
+        filtered, prob_col=prob_col, outcome_col=outcome_col, min_per_cell=15,
+    )
     if heatmap_df.empty:
         st.info("Not enough per-cell samples yet — extend the window or pick fewer model filters.")
     else:
@@ -1010,7 +1244,9 @@ def _render_calibration(window_hours: int) -> None:
 
     # ----- Worst station-hour drill-in -----
     st.markdown("#### Worst-offender station-hours")
-    worst = dashboard_metrics.worst_station_hours(filtered, top=25)
+    worst = dashboard_metrics.worst_station_hours(
+        filtered, prob_col=prob_col, outcome_col=outcome_col, top=25,
+    )
     if worst.empty:
         st.info("Not enough per-station samples.")
     else:

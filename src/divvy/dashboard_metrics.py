@@ -22,6 +22,41 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
+# Derived target: P(has open dock)
+# ---------------------------------------------------------------------------
+
+
+def derive_dock_target(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach ``p_has_open_dock`` and ``observed_has_open_dock`` columns.
+
+    The predictor stores ``p_dock_constrained_arrival`` ("an incoming bike
+    can't dock") and ``p_capacity_violation`` ("station is full"). For the
+    rider question "is there an open dock when I get there?", the cleaner
+    quantity is the complement of the dock-constrained probability. We fall
+    back to (1 − p_capacity_violation) when the dock-constrained field is
+    missing.
+
+    Observed truth comes from ``observed_docks`` (a station with one open
+    dock counts as "has open dock"). Rows with no predicted dock signal
+    leave ``p_has_open_dock`` as NaN so downstream filters can drop them.
+    """
+    out = df.copy()
+    if "p_dock_constrained_arrival" in out.columns:
+        primary = pd.to_numeric(out["p_dock_constrained_arrival"], errors="coerce")
+    else:
+        primary = pd.Series([np.nan] * len(out), index=out.index, dtype="float64")
+    if "p_capacity_violation" in out.columns:
+        fallback = pd.to_numeric(out["p_capacity_violation"], errors="coerce")
+        primary = primary.fillna(fallback)
+    out["p_has_open_dock"] = (1.0 - primary.clip(0.0, 1.0))
+    if "observed_docks" in out.columns:
+        observed_docks = pd.to_numeric(out["observed_docks"], errors="coerce")
+        out["observed_has_open_dock"] = (observed_docks > 0).astype(float)
+        out.loc[observed_docks.isna(), "observed_has_open_dock"] = np.nan
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Binary calibration: reliability curve with Wilson confidence intervals
 # ---------------------------------------------------------------------------
 

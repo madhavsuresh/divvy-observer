@@ -297,6 +297,48 @@ def test_coverage_heatmap_drops_sparse_cells():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Dock-target derivation
+# ---------------------------------------------------------------------------
+
+
+def test_derive_dock_target_complements_dock_constrained():
+    df = pd.DataFrame({
+        "p_dock_constrained_arrival": [0.0, 0.25, 0.9, None],
+        "observed_docks": [3, 0, 0, 2],
+    })
+    out = dm.derive_dock_target(df)
+    assert out["p_has_open_dock"].tolist()[:3] == [pytest.approx(1.0), pytest.approx(0.75), pytest.approx(0.1)]
+    # Row 3 has no dock-constrained signal — should fall back; we have no
+    # fallback column in this frame so the value should be NaN.
+    assert pd.isna(out["p_has_open_dock"].iloc[3])
+    # observed_has_open_dock = (docks > 0)
+    assert out["observed_has_open_dock"].tolist() == [1.0, 0.0, 0.0, 1.0]
+
+
+def test_derive_dock_target_falls_back_to_capacity_violation():
+    df = pd.DataFrame({
+        "p_dock_constrained_arrival": [None, 0.4],
+        "p_capacity_violation": [0.2, 0.99],
+        "observed_docks": [5, 0],
+    })
+    out = dm.derive_dock_target(df)
+    # First row: dock_constrained is None, fall back to capacity_violation = 0.2 → open dock = 0.8
+    assert out["p_has_open_dock"].iloc[0] == pytest.approx(0.8)
+    # Second row: dock_constrained is 0.4 (winning) → open dock = 0.6
+    assert out["p_has_open_dock"].iloc[1] == pytest.approx(0.6)
+
+
+def test_derive_dock_target_handles_missing_columns():
+    df = pd.DataFrame({"forecast_id": ["a"]})
+    out = dm.derive_dock_target(df)
+    # No predicted-side data → p_has_open_dock is all NaN.
+    assert "p_has_open_dock" in out.columns
+    assert pd.isna(out["p_has_open_dock"].iloc[0])
+    # No observed-side data → observed column should not be added.
+    assert "observed_has_open_dock" not in out.columns
+
+
 def test_skill_score_positive_when_model_beats_baseline():
     assert dm.skill_score(0.1, 0.2) == pytest.approx(0.5)
 
