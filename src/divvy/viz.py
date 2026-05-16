@@ -23,6 +23,10 @@ DIVERGING_PALETTE = "redblue"
 SEQUENTIAL_PALETTE = "reds"
 CHART_HEIGHT = 220
 
+# Rider-facing target colours: blue for "find a bike", orange for "find a dock".
+BIKE_COLOR = "#1f77b4"
+DOCK_COLOR = "#ff7f0e"
+
 
 def _empty_placeholder(title: str, message: str = "No resolved outcomes yet.") -> alt.Chart:
     return (
