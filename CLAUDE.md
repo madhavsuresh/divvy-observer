@@ -13,8 +13,9 @@ The README (`README.md`) is the canonical source for env vars, the data model, a
 ```bash
 uv sync                                  # install deps into .venv
 ./run.sh                                 # collector + automation + API (:8000) + dashboard (:8501), foreground
-./run.sh --launchd                       # install/start macOS LaunchAgents instead
-uv run divvy {status,health,stop,launchd-status}
+./run.sh stop                            # kill workers + unload any divvy LaunchAgent plists
+./run.sh status                          # show running services, port bindings, plist files
+uv run divvy {status,health,stop,launchd-status}   # LaunchAgent path is opt-in via `uv run divvy start`
 uv run pytest                            # full suite
 uv run pytest -m 'not slow'              # skip the slow marker
 uv run pytest tests/test_predictor.py::test_name   # single test
