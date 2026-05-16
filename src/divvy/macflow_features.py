@@ -554,4 +554,26 @@ def apply_runtime_defaults(
             if col in {"community_id", "role_id"}:
                 continue
             out[col] = default
+
+    # Metra commuter-rail event features. Adds N_FEATURES columns named
+    # "metra_*" — zero everywhere except at the ~21 Divvy stations that sit
+    # within ~400m of a Metra stop and have a measurable train-arrival lift
+    # (see divvy/metra.py). Done after the partition-mode neutralization
+    # because the Metra signal is per-station and orthogonal to the
+    # community-flow features the partition_mode controls.
+    try:
+        from . import metra as _metra
+        out = _metra.attach_metra_features(out, ts_col="anchor_ts" if "anchor_ts" in out.columns else "forecasted_at")
+    except Exception:
+        # Don't let a Metra-feature failure break macflow training.
+        # Fall back to all-zero so the column set stays consistent.
+        for k in (
+            "is_near_metra", "metra_distance_m", "metra_arr_in_5m", "metra_arr_in_10m",
+            "metra_arr_in_30m", "metra_dep_in_5m", "metra_dep_in_10m", "metra_dep_in_30m",
+            "metra_arr_in_last_5m", "metra_arr_in_last_10m", "metra_dep_in_last_5m",
+            "metra_pickup_lift", "metra_dropoff_lift",
+            "metra_pickup_lift_x_arr_5m", "metra_dropoff_lift_x_dep_5m",
+        ):
+            if k not in out.columns:
+                out[k] = 0.0
     return out

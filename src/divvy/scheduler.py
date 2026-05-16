@@ -82,6 +82,10 @@ def default_scheduler() -> Scheduler:
             # (Divvy publishes around the 10th — running daily catches it
             # within ~24h without re-downloading anything we already have).
             ScheduledJob("sync-tripdata", interval_seconds=24 * 3600),
+            # Metra GTFS rarely changes; weekly is plenty. The per-pair event
+            # study runs against divvy_trips so it picks up new historical
+            # data as the trip backfill grows.
+            ScheduledJob("sync-metra", interval_seconds=7 * 24 * 3600),
             ScheduledJob("train-nightly", local_time=_parse_local_time(config.NIGHTLY_TRAIN_LOCAL_TIME)),
             ScheduledJob(
                 "train-weekly",

@@ -120,6 +120,20 @@ MACFLOW_NUMERIC_COLUMNS: list[str] = NUMERIC_FEATURE_COLUMNS + [
     "od_arrival_pressure_external",
     "community_exchange_in_pressure",
     "community_exchange_out_pressure",
+    # Metra commuter-rail event features (see divvy/metra.py).
+    # Non-zero only at the ~21 Divvy stations within 400m of a Metra stop
+    # that have a measurable train-arrival lift in the event study.
+    "is_near_metra",
+    "metra_arr_in_5m",
+    "metra_arr_in_30m",
+    "metra_dep_in_5m",
+    "metra_dep_in_30m",
+    "metra_arr_in_last_5m",
+    "metra_dep_in_last_5m",
+    "metra_pickup_lift",
+    "metra_dropoff_lift",
+    "metra_pickup_lift_x_arr_5m",
+    "metra_dropoff_lift_x_dep_5m",
 ]
 
 

@@ -28,6 +28,7 @@ from . import (
     train_sota,
     tripdata,
 )
+from . import metra
 
 
 log = logging.getLogger("divvy.automation")
@@ -48,6 +49,7 @@ WRITE_JOBS = {
     "refresh-graphs",
     "sync-tripdata",
     "retrain-macflow",
+    "sync-metra",
 }
 
 
@@ -237,6 +239,17 @@ def _job_retrain_macflow() -> dict:
     return train_sota.train_single(args)
 
 
+def _job_sync_metra() -> dict:
+    """Refresh Metra GTFS + per-pair Divvy lift coefficients.
+
+    Quarterly cadence is fine — Metra publishes its GTFS infrequently and
+    the per-pair event study (which scans 12 months of divvy_trips) is the
+    expensive part, so daily refreshes would waste cycles. Cheap to call
+    on demand if a new Metra schedule lands.
+    """
+    return metra.sync()
+
+
 JOBS: dict[str, Callable[[], dict]] = {
     "drain-forecast-queue": _job_drain_forecast_queue,
     "resolve-outcomes": _job_resolve_outcomes,
@@ -252,6 +265,7 @@ JOBS: dict[str, Callable[[], dict]] = {
     "refresh-graphs": _job_refresh_graphs,
     "sync-tripdata": _job_sync_tripdata,
     "retrain-macflow": _job_retrain_macflow,
+    "sync-metra": _job_sync_metra,
 }
 
 
