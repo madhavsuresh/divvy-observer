@@ -537,6 +537,13 @@ def connect(read_only: bool = False, retries: int = 60, retry_sleep: float = 0.5
     file open read-write (and vice versa). The poller and dashboard both use
     short-lived connections to keep contention windows small; this retry covers
     the occasional collision.
+
+    The default 60 retries × 0.5s = 30s is tuned for the dashboard/API read path
+    — fail fast when the writer is busy so the UI shows "DB busy" instead of
+    hanging. Long-running writers that can be starved by a concurrent automation
+    job (the collector at startup, nightly trainers) should pass a larger
+    explicit ``retries=`` so they wait through the job instead of crashing.
+    Do not raise the default — 33+ read-only callers inherit it.
     """
     config.ensure_dirs()
     last_exc: Exception | None = None
