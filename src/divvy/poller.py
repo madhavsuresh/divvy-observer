@@ -149,7 +149,7 @@ def run_due_external_polls(state: PollerState, now: float) -> dict[str, int]:
         status = "ok"
         error_msg: str | None = None
         try:
-            with db.session(read_only=False, retries=10) as conn:
+            with db.session(read_only=False, retries=60) as conn:
                 rows = int(fn(conn) or 0)
                 state.last_external_poll_unix[name] = now
                 _log_external_poll(
@@ -166,7 +166,7 @@ def run_due_external_polls(state: PollerState, now: float) -> dict[str, int]:
             status = "error"
             error_msg = str(exc)[:500]
             try:
-                with db.session(read_only=False, retries=10) as conn:
+                with db.session(read_only=False, retries=60) as conn:
                     _log_external_poll(
                         conn,
                         name,
@@ -672,7 +672,12 @@ def poll_once(state: PollerState) -> None:
         except Exception as exc:
             log.exception("self-eval pre-scoring failed: %s", exc)
 
-    with db.session(read_only=False) as conn:
+    # Use a patient retry — the collector tick is the one writer we never
+    # want to drop. Automation jobs (drain-forecast-queue, resolve-outcomes,
+    # refresh-live-predictions, nightly trainers) can hold the writer for
+    # ~1-2 min and the default 30s would crash this tick and lose a snapshot.
+    # 600 retries × 0.5s = 5 min ceiling; we'd rather wait than miss data.
+    with db.session(read_only=False, retries=600, retry_sleep=0.5) as conn:
         db.init_schema(conn)
         if info_payload is not None:
             n_stations = upsert_stations(conn, info_payload)
