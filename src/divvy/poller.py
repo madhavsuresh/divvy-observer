@@ -149,7 +149,7 @@ def run_due_external_polls(state: PollerState, now: float) -> dict[str, int]:
         status = "ok"
         error_msg: str | None = None
         try:
-            with db.session(read_only=False, retries=10) as conn:
+            with db.session(read_only=False, retries=60) as conn:
                 rows = int(fn(conn) or 0)
                 state.last_external_poll_unix[name] = now
                 _log_external_poll(
@@ -166,7 +166,7 @@ def run_due_external_polls(state: PollerState, now: float) -> dict[str, int]:
             status = "error"
             error_msg = str(exc)[:500]
             try:
-                with db.session(read_only=False, retries=10) as conn:
+                with db.session(read_only=False, retries=60) as conn:
                     _log_external_poll(
                         conn,
                         name,
@@ -413,7 +413,12 @@ def insert_free_bikes(conn, payload: dict[str, Any]) -> int:
             "lon": float(b["lon"]) if b.get("lon") is not None else None,
             "is_reserved": bool(b.get("is_reserved")),
             "is_disabled": bool(b.get("is_disabled")),
-            "vehicle_type_id": b.get("vehicle_type_id"),
+            # Divvy uses a non-standard `type` field ("electric_bike" /
+            # "classic_bike") instead of the GBFS-standard `vehicle_type_id`
+            # that would point into vehicle_types.json (which Divvy doesn't
+            # publish). Prefer vehicle_type_id when present (forward-compat),
+            # fall back to type.
+            "vehicle_type_id": b.get("vehicle_type_id") or b.get("type"),
             "current_range_meters": (
                 float(b["current_range_meters"])
                 if b.get("current_range_meters") is not None
@@ -632,17 +637,24 @@ def _sleep_until_next_tick(interval: int, should_continue) -> None:
 def poll_once(state: PollerState) -> None:
     now = time.time()
     need_info = (now - state.last_info_refresh_unix) >= config.STATION_INFO_REFRESH_SECONDS
+    # cadence <= 0 disables the poll entirely (Divvy doesn't publish
+    # vehicle_types.json, so this is the default).
     need_vehicle_types = (
-        now - state.last_vehicle_types_refresh_unix
-    ) >= config.VEHICLE_TYPES_REFRESH_SECONDS
+        config.VEHICLE_TYPES_REFRESH_SECONDS > 0
+        and (now - state.last_vehicle_types_refresh_unix) >= config.VEHICLE_TYPES_REFRESH_SECONDS
+    )
 
     info_payload = _fetch(config.STATION_INFO_URL) if need_info else None
     status_payload = _fetch(config.STATION_STATUS_URL)
     free_payload = _fetch(config.FREE_BIKE_STATUS_URL)
     alerts_payload = _fetch_optional(config.SYSTEM_ALERTS_URL)
-    vehicle_types_payload = (
-        _fetch_optional(config.VEHICLE_TYPES_URL) if need_vehicle_types else None
-    )
+    if need_vehicle_types:
+        vehicle_types_payload = _fetch_optional(config.VEHICLE_TYPES_URL)
+        # Bump the refresh clock regardless of fetch outcome — otherwise a
+        # permanent 403/404 retries every tick and floods the log.
+        state.last_vehicle_types_refresh_unix = now
+    else:
+        vehicle_types_payload = None
 
     # Score self-eval candidates before acquiring the write lock so ML inference
     # doesn't contribute to write-lock hold time (which starves automation jobs).
@@ -660,7 +672,12 @@ def poll_once(state: PollerState) -> None:
         except Exception as exc:
             log.exception("self-eval pre-scoring failed: %s", exc)
 
-    with db.session(read_only=False) as conn:
+    # Use a patient retry — the collector tick is the one writer we never
+    # want to drop. Automation jobs (drain-forecast-queue, resolve-outcomes,
+    # refresh-live-predictions, nightly trainers) can hold the writer for
+    # ~1-2 min and the default 30s would crash this tick and lose a snapshot.
+    # 600 retries × 0.5s = 5 min ceiling; we'd rather wait than miss data.
+    with db.session(read_only=False, retries=600, retry_sleep=0.5) as conn:
         db.init_schema(conn)
         if info_payload is not None:
             n_stations = upsert_stations(conn, info_payload)
@@ -677,7 +694,6 @@ def poll_once(state: PollerState) -> None:
         if vehicle_types_payload is not None:
             try:
                 vt_rows = upsert_vehicle_types(conn, vehicle_types_payload)
-                state.last_vehicle_types_refresh_unix = now
                 if vt_rows:
                     log.info("refreshed gbfs_vehicle_types: %d rows", vt_rows)
             except Exception as exc:
