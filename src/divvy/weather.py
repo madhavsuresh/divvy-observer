@@ -26,6 +26,7 @@ HOURLY_VARIABLES = [
     "cloud_cover",
     "wind_speed_10m",
     "wind_gusts_10m",
+    "wind_direction_10m",
     "weather_code",
 ]
 
@@ -95,12 +96,14 @@ def upsert_weather(conn: duckdb.DuckDBPyConnection, weather_rows: pd.DataFrame) 
             INSERT INTO weather_hourly (
               observed_at, source, temperature_2m, relative_humidity_2m,
               apparent_temperature, precipitation, rain, snowfall, snow_depth,
-              cloud_cover, wind_speed_10m, wind_gusts_10m, weather_code, fetched_at
+              cloud_cover, wind_speed_10m, wind_gusts_10m, wind_direction_10m,
+              weather_code, fetched_at
             )
             SELECT
               observed_at, source, temperature_2m, relative_humidity_2m,
               apparent_temperature, precipitation, rain, snowfall, snow_depth,
-              cloud_cover, wind_speed_10m, wind_gusts_10m, weather_code, fetched_at
+              cloud_cover, wind_speed_10m, wind_gusts_10m, wind_direction_10m,
+              weather_code, fetched_at
             FROM _weather_ingest
             """
         )
@@ -166,6 +169,177 @@ def sync_recent_history(conn: duckdb.DuckDBPyConnection, days: int = 90) -> int:
 def sync_forecast(conn: duckdb.DuckDBPyConnection, days: int = 3) -> int:
     rows = fetch_forecast_weather(days=days)
     return upsert_weather(conn, rows)
+
+
+# ---------------------------------------------------------------------------
+# Forecast snapshots — capture what the forecast SAID at each tick so model
+# replay doesn't get to peek at the actual outcome via weather_hourly.
+# ---------------------------------------------------------------------------
+
+FORECAST_HOURLY_VARIABLES = [
+    *HOURLY_VARIABLES,
+    "precipitation_probability",
+]
+
+NOWCAST_MINUTELY_VARIABLES = [
+    "precipitation",
+    "rain",
+    "snowfall",
+]
+
+
+def _open_meteo_get(url: str, params: dict, timeout_seconds: int = 30) -> dict:
+    resp = requests.get(url, params=params, timeout=timeout_seconds)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def poll_forecast_snapshot(
+    conn: duckdb.DuckDBPyConnection,
+    hours_ahead: int | None = None,
+    lat: float = CHICAGO_LAT,
+    lon: float = CHICAGO_LON,
+) -> int:
+    """Capture the current forecast as a snapshot, keyed by (snapshot_at, for_at).
+
+    Required for honest replay: weather_hourly stores observed values, which
+    leak future state into a model that uses 'next-hour weather as feature.'
+    Each row here is 'as of snapshot_at, the model expected for_at to look
+    like this' — exactly what a live model would have seen.
+    """
+    from . import config as _config
+    if hours_ahead is None:
+        hours_ahead = _config.WEATHER_FORECAST_HOURS_AHEAD
+    forecast_days = max(1, (hours_ahead + 23) // 24)
+    payload = _open_meteo_get(
+        OPEN_METEO_FORECAST_URL,
+        {
+            "latitude": lat,
+            "longitude": lon,
+            "forecast_days": min(forecast_days, 16),
+            "hourly": ",".join(FORECAST_HOURLY_VARIABLES),
+            "timezone": LOCAL_TZ,
+            "wind_speed_unit": "kmh",
+            "precipitation_unit": "mm",
+        },
+    )
+    hourly = payload.get("hourly") or {}
+    times = hourly.get("time") or []
+    if not times:
+        return 0
+
+    snapshot_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    forecast_for = _to_utc_naive(pd.Series(times))
+
+    frame = pd.DataFrame({"forecast_for_at": forecast_for})
+    for var in FORECAST_HOURLY_VARIABLES:
+        frame[var] = pd.to_numeric(
+            pd.Series(hourly.get(var, [pd.NA] * len(frame))),
+            errors="coerce",
+        )
+    frame = frame.dropna(subset=["forecast_for_at"])
+    # Keep only forecasts inside our intended horizon (avoid storing the next
+    # 16 days when the user asked for 24h).
+    cutoff = snapshot_at + pd.Timedelta(hours=hours_ahead)
+    frame = frame[(frame["forecast_for_at"] >= snapshot_at - pd.Timedelta(hours=1)) & (frame["forecast_for_at"] <= cutoff)]
+    if frame.empty:
+        return 0
+    frame["horizon_minutes"] = (
+        (frame["forecast_for_at"] - snapshot_at).dt.total_seconds() / 60.0
+    ).round().astype("Int64")
+    frame["snapshot_at"] = snapshot_at
+    frame["source"] = "open-meteo"
+    frame["weather_code"] = pd.to_numeric(frame["weather_code"], errors="coerce").astype("Int64")
+
+    conn.register("_forecast_snap", frame)
+    try:
+        conn.execute(
+            """
+            INSERT INTO weather_forecast_snapshots
+              (snapshot_at, forecast_for_at, horizon_minutes,
+               temperature_2m, apparent_temperature, relative_humidity_2m,
+               precipitation, precipitation_probability, rain, snowfall,
+               cloud_cover, wind_speed_10m, wind_gusts_10m,
+               wind_direction_10m, weather_code, source)
+            SELECT
+              snapshot_at, forecast_for_at, horizon_minutes,
+              temperature_2m, apparent_temperature, relative_humidity_2m,
+              precipitation, precipitation_probability, rain, snowfall,
+              cloud_cover, wind_speed_10m, wind_gusts_10m,
+              wind_direction_10m, weather_code, source
+            FROM _forecast_snap
+            ON CONFLICT (snapshot_at, forecast_for_at) DO NOTHING
+            """
+        )
+    finally:
+        conn.unregister("_forecast_snap")
+    return int(len(frame))
+
+
+def poll_nowcast(
+    conn: duckdb.DuckDBPyConnection,
+    lat: float = CHICAGO_LAT,
+    lon: float = CHICAGO_LON,
+) -> int:
+    """Pull Open-Meteo minutely_15 precipitation forecast — next ~1 hour.
+
+    This is the only signal that catches 'will it rain in the next 20 minutes',
+    which the hourly grid blurs out. Stored separately so a re-poll just
+    overwrites the same observed_at rows with the most recent estimate.
+    """
+    payload = _open_meteo_get(
+        OPEN_METEO_FORECAST_URL,
+        {
+            "latitude": lat,
+            "longitude": lon,
+            "forecast_days": 1,
+            "minutely_15": ",".join(NOWCAST_MINUTELY_VARIABLES),
+            "timezone": LOCAL_TZ,
+            "precipitation_unit": "mm",
+        },
+    )
+    minutely = payload.get("minutely_15") or {}
+    times = minutely.get("time") or []
+    if not times:
+        return 0
+
+    fetched_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    observed_at = _to_utc_naive(pd.Series(times))
+
+    frame = pd.DataFrame({"observed_at": observed_at})
+    for var in NOWCAST_MINUTELY_VARIABLES:
+        frame[var] = pd.to_numeric(
+            pd.Series(minutely.get(var, [pd.NA] * len(frame))),
+            errors="coerce",
+        )
+    frame = frame.dropna(subset=["observed_at"])
+    if frame.empty:
+        return 0
+    # Keep only the next ~75 minutes; the rest is the hourly grid in disguise.
+    cutoff = fetched_at + pd.Timedelta(minutes=75)
+    frame = frame[frame["observed_at"] <= cutoff]
+    if frame.empty:
+        return 0
+    frame["source"] = "open-meteo-minutely_15"
+    frame["fetched_at"] = fetched_at
+
+    conn.register("_nowcast", frame)
+    try:
+        conn.execute(
+            """
+            DELETE FROM weather_nowcast
+            WHERE observed_at IN (SELECT observed_at FROM _nowcast)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO weather_nowcast (observed_at, source, precipitation, rain, snowfall, fetched_at)
+            SELECT observed_at, source, precipitation, rain, snowfall, fetched_at FROM _nowcast
+            """
+        )
+    finally:
+        conn.unregister("_nowcast")
+    return int(len(frame))
 
 
 def ingest_csv(conn: duckdb.DuckDBPyConnection, path: Path) -> int:

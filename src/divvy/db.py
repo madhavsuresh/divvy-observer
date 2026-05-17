@@ -56,6 +56,42 @@ CREATE INDEX IF NOT EXISTS idx_free_bike_bike_id ON free_bike_status(bike_id);
 ALTER TABLE free_bike_status ADD COLUMN IF NOT EXISTS tile_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_free_bike_tile_time ON free_bike_status(tile_id, fetched_at);
 
+ALTER TABLE free_bike_status ADD COLUMN IF NOT EXISTS vehicle_type_id TEXT;
+ALTER TABLE free_bike_status ADD COLUMN IF NOT EXISTS current_range_meters DOUBLE;
+ALTER TABLE free_bike_status ADD COLUMN IF NOT EXISTS current_fuel_percent DOUBLE;
+
+CREATE TABLE IF NOT EXISTS gbfs_system_alerts (
+  alert_id            TEXT      NOT NULL,
+  last_updated_at     TIMESTAMP NOT NULL,
+  alert_type          TEXT,
+  station_ids_json    JSON,
+  region_ids_json     JSON,
+  start_ts            TIMESTAMP,
+  end_ts              TIMESTAMP,
+  url                 TEXT,
+  summary             TEXT,
+  description         TEXT,
+  raw_json            JSON,
+  first_observed_at   TIMESTAMP NOT NULL,
+  last_observed_at    TIMESTAMP NOT NULL,
+  PRIMARY KEY (alert_id, last_updated_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gbfs_alerts_observed
+  ON gbfs_system_alerts(first_observed_at, last_observed_at);
+
+CREATE TABLE IF NOT EXISTS gbfs_vehicle_types (
+  vehicle_type_id    TEXT PRIMARY KEY,
+  form_factor        TEXT,
+  propulsion_type    TEXT,
+  name               TEXT,
+  max_range_meters   DOUBLE,
+  return_constraint  TEXT,
+  raw_json           JSON,
+  first_seen_at      TIMESTAMP NOT NULL,
+  last_seen_at       TIMESTAMP NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS divvy_trips (
   ride_id             TEXT PRIMARY KEY,
   rideable_type       TEXT,
@@ -148,6 +184,8 @@ CREATE TABLE IF NOT EXISTS weather_hourly (
 );
 
 CREATE INDEX IF NOT EXISTS idx_weather_hourly_observed ON weather_hourly(observed_at);
+
+ALTER TABLE weather_hourly ADD COLUMN IF NOT EXISTS wind_direction_10m DOUBLE;
 
 CREATE TABLE IF NOT EXISTS collector_ticks (
   tick_id                         TEXT PRIMARY KEY,
@@ -521,6 +559,145 @@ CREATE TABLE IF NOT EXISTS recommendation_outcomes (
 
 CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_model ON recommendation_outcomes(model_key);
 CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_target ON recommendation_outcomes(target_at);
+
+CREATE TABLE IF NOT EXISTS air_quality_observations (
+  observed_at       TIMESTAMP NOT NULL,
+  zipcode           TEXT      NOT NULL,
+  parameter         TEXT      NOT NULL,
+  aqi               INTEGER,
+  category          TEXT,
+  reporting_area    TEXT,
+  state_code        TEXT,
+  lat               DOUBLE,
+  lon               DOUBLE,
+  fetched_at        TIMESTAMP,
+  PRIMARY KEY (observed_at, zipcode, parameter)
+);
+
+CREATE INDEX IF NOT EXISTS idx_air_quality_observed ON air_quality_observations(observed_at);
+
+CREATE TABLE IF NOT EXISTS chicago_traffic_regions (
+  region_id         TEXT      NOT NULL,
+  observed_at       TIMESTAMP NOT NULL,
+  region_name       TEXT,
+  speed_mph         DOUBLE,
+  bus_count         INTEGER,
+  west              DOUBLE,
+  east              DOUBLE,
+  north             DOUBLE,
+  south             DOUBLE,
+  description       TEXT,
+  fetched_at        TIMESTAMP,
+  PRIMARY KEY (region_id, observed_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_traffic_observed ON chicago_traffic_regions(observed_at);
+
+CREATE TABLE IF NOT EXISTS chicago_311_requests (
+  sr_number         TEXT PRIMARY KEY,
+  sr_type           TEXT,
+  sr_short_code     TEXT,
+  status            TEXT,
+  created_at        TIMESTAMP,
+  closed_at         TIMESTAMP,
+  community_area    INTEGER,
+  ward              INTEGER,
+  street_address    TEXT,
+  city              TEXT,
+  zip_code          TEXT,
+  lat               DOUBLE,
+  lon               DOUBLE,
+  raw_json          JSON,
+  fetched_at        TIMESTAMP,
+  last_seen_at      TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_311_created ON chicago_311_requests(created_at);
+CREATE INDEX IF NOT EXISTS idx_311_type ON chicago_311_requests(sr_type);
+
+CREATE TABLE IF NOT EXISTS cta_alerts (
+  alert_id              TEXT      NOT NULL,
+  last_updated_at       TIMESTAMP NOT NULL,
+  severity              TEXT,
+  service_id            TEXT,
+  headline              TEXT,
+  short_description     TEXT,
+  full_description      TEXT,
+  start_ts              TIMESTAMP,
+  end_ts                TIMESTAMP,
+  major_alert           BOOLEAN,
+  alert_url             TEXT,
+  impacted_services_json JSON,
+  raw_json              JSON,
+  first_observed_at     TIMESTAMP NOT NULL,
+  last_observed_at      TIMESTAMP NOT NULL,
+  PRIMARY KEY (alert_id, last_updated_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cta_alerts_observed
+  ON cta_alerts(first_observed_at, last_observed_at);
+
+CREATE TABLE IF NOT EXISTS chicago_bridge_lifts (
+  lift_id           TEXT PRIMARY KEY,
+  scheduled_start   TIMESTAMP NOT NULL,
+  scheduled_end     TIMESTAMP,
+  direction         TEXT,
+  bridges_json      JSON,
+  season            TEXT,
+  source            TEXT,
+  notes             TEXT,
+  created_at        TIMESTAMP DEFAULT now(),
+  updated_at        TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_bridge_lifts_start
+  ON chicago_bridge_lifts(scheduled_start);
+
+CREATE TABLE IF NOT EXISTS weather_forecast_snapshots (
+  snapshot_at               TIMESTAMP NOT NULL,
+  forecast_for_at           TIMESTAMP NOT NULL,
+  horizon_minutes           INTEGER,
+  temperature_2m            DOUBLE,
+  apparent_temperature      DOUBLE,
+  relative_humidity_2m      DOUBLE,
+  precipitation             DOUBLE,
+  precipitation_probability DOUBLE,
+  rain                      DOUBLE,
+  snowfall                  DOUBLE,
+  cloud_cover               DOUBLE,
+  wind_speed_10m            DOUBLE,
+  wind_gusts_10m            DOUBLE,
+  wind_direction_10m        DOUBLE,
+  weather_code              INTEGER,
+  source                    TEXT,
+  PRIMARY KEY (snapshot_at, forecast_for_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_weather_forecast_for
+  ON weather_forecast_snapshots(forecast_for_at);
+
+CREATE TABLE IF NOT EXISTS weather_nowcast (
+  observed_at       TIMESTAMP NOT NULL,
+  source            TEXT,
+  precipitation     DOUBLE,
+  rain              DOUBLE,
+  snowfall          DOUBLE,
+  fetched_at        TIMESTAMP,
+  PRIMARY KEY (observed_at)
+);
+
+CREATE TABLE IF NOT EXISTS external_data_poll_log (
+  source            TEXT      NOT NULL,
+  polled_at         TIMESTAMP NOT NULL,
+  rows_affected     INTEGER,
+  status            TEXT,
+  error_message     TEXT,
+  duration_ms       INTEGER,
+  PRIMARY KEY (source, polled_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_poll_source
+  ON external_data_poll_log(source, polled_at);
 """
 
 
