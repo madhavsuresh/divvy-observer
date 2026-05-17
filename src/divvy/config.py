@@ -11,7 +11,10 @@ VEHICLE_TYPES_URL = "https://gbfs.divvybikes.com/gbfs/en/vehicle_types.json"
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("DIVVY_POLL_INTERVAL", "60"))
 STATION_INFO_REFRESH_SECONDS = int(os.environ.get("DIVVY_INFO_REFRESH", str(6 * 60 * 60)))
-VEHICLE_TYPES_REFRESH_SECONDS = int(os.environ.get("DIVVY_VEHICLE_TYPES_REFRESH", str(24 * 60 * 60)))
+# Divvy/Lyft does not publish gbfs/en/vehicle_types.json (not in the GBFS
+# discovery doc), so default to disabled. Set DIVVY_VEHICLE_TYPES_REFRESH
+# to a positive number of seconds to opt in if upstream starts shipping it.
+VEHICLE_TYPES_REFRESH_SECONDS = int(os.environ.get("DIVVY_VEHICLE_TYPES_REFRESH", "0"))
 
 # ---------------------------------------------------------------------------
 # External data sources (Bucket 2 + weather forecast capture).
