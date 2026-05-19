@@ -550,6 +550,22 @@ def _render_find_a_bike() -> None:
     best = payload.get("best_practical_station_5_10m") or {}
     alternatives = payload.get("reliable_alternatives") or []
 
+    nearby_floaters = pd.DataFrame()
+    if show_bike:
+        all_floaters = _free_bikes()
+        if not all_floaters.empty:
+            all_floaters = all_floaters.copy()
+            all_floaters["distance_km"] = all_floaters.apply(
+                lambda r: recommendations.haversine_km(lat, lon, r["lat"], r["lon"]),
+                axis=1,
+            )
+            nearby_floaters = (
+                all_floaters[all_floaters["distance_km"] <= search_radius_km]
+                .sort_values("distance_km")
+                .reset_index(drop=True)
+            )
+    closest_floater = payload.get("closest_free_ebike")
+
     # ----- Hero card -----
     st.markdown("### Recommended right now")
     hero_cols = st.columns([1.4, 1])
@@ -576,6 +592,18 @@ def _render_find_a_bike() -> None:
             st.caption(
                 f"Conservative bike estimate (95% LCB after calibration): "
                 f"{_prob_label(lcb)}. Use this as your worst-case planning bet."
+            )
+        if show_bike and (not nearby_floaters.empty or closest_floater):
+            floater_count = len(nearby_floaters) if not nearby_floaters.empty else 1
+            closest_km = (
+                float(nearby_floaters.iloc[0]["distance_km"])
+                if not nearby_floaters.empty
+                else float(closest_floater.get("distance_km") or 0.0)
+            )
+            st.caption(
+                f"🛴 {floater_count} free-floating eBike{'s' if floater_count != 1 else ''} "
+                f"in range — closest is {_km_label(closest_km)} away "
+                f"(shown as ⚪ on the map)."
             )
         st.caption(f"Active model: `{payload.get('active_model_key') or '—'}`")
 
@@ -622,6 +650,23 @@ def _render_find_a_bike() -> None:
                 get_radius=70,
             ),
         ]
+        if show_bike and not nearby_floaters.empty:
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=nearby_floaters,
+                    get_position=["lon", "lat"],
+                    get_fill_color=[255, 255, 255, 235],
+                    get_line_color=[40, 40, 40, 220],
+                    line_width_min_pixels=1,
+                    stroked=True,
+                    filled=True,
+                    get_radius=35,
+                    radius_min_pixels=5,
+                    radius_max_pixels=10,
+                    pickable=True,
+                ),
+            )
         deck = pdk.Deck(
             layers=layers,
             initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=14, pitch=0),
